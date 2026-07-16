@@ -1,0 +1,16 @@
+
+--- Calibration Iteration: 2026-07-16 19:50:36 ---
+Result Path: /home/rainbow/camera_ws/result/result_step2/result_20260716_195035.json
+Right Arm Joint Offset (deg): [0.2489471238510028, 2.417571265518657, 1.2027537340701284, 0.4977899911228563, -1.4497934533433008, 5.45959837848296, 2.3499268034056695]
+Left Arm Joint Offset (deg): [-0.44649077967681294, -1.596649076983978, -0.9150206879318246, 0.6993098445730823, 0.9630448241630397, -2.9392722153060458, 3.49865627592973]
+Head Joint Offset (deg): [-0.06939895112859859, -0.3504391754932142]
+Camera xi: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+Measurement Noise: {"measurement_noise_enabled": true, "measurement_noise_rot_std_rad": 0.0022634140344566294, "measurement_noise_rot_std_deg": 0.12968407146504315, "measurement_noise_pos_std_m": 3.948710291093625e-05, "measurement_noise_pos_std_mm": 0.03948710291093625, "measurement_noise_max_rot_std_rad": 0.03490658503988659, "measurement_noise_max_rot_std_deg": 2.0, "measurement_noise_max_pos_std_m": 0.001, "measurement_noise_max_pos_std_mm": 1.0}
+
+--- Calibration Iteration: 2026-07-16 19:55:20 ---
+Result Path: /home/rainbow/camera_ws/result/result_step2/result_20260716_195518.json
+Right Arm Joint Offset (deg): [0.13178035520665546, -5.9527533009887795e-08, 3.3732376455485498, 0.49778999868247553, -6.163663677382695, 5.45959838027308, 2.3479268132917146]
+Left Arm Joint Offset (deg): [-0.6857213790238977, 3.3098278644164664e-08, -2.9951279369515285, 0.6993098491855186, 5.485944308689784, -2.939272222586399, 3.5006562835798563]
+Head Joint Offset (deg): [-0.06939895112860216, -0.3504391754931689]
+Camera xi: [-0.00011193883780461934, 8.587525317084006e-05, -0.0006781383036074248, 0.0004943702907054045, -0.11481163270859929, -0.060661254107489536]
+Measurement Noise: {"measurement_noise_enabled": true, "measurement_noise_rot_std_rad": 0.03304801200039004, "measurement_noise_rot_std_deg": 1.8935116089200463, "measurement_noise_pos_std_m": 0.0009999999999981812, "measurement_noise_pos_std_mm": 0.9999999999981811, "measurement_noise_max_rot_std_rad": 0.03490658503988659, "measurement_noise_max_rot_std_deg": 2.0, "measurement_noise_max_pos_std_m": 0.001, "measurement_noise_max_pos_std_mm": 1.0}

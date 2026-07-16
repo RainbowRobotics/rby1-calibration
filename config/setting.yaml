@@ -1,0 +1,37 @@
+camera:
+  Tf_to_marker_left: [0.00000, 0.05450, -0.05020, 90.04, 0.11, 0.00]
+  Tf_to_marker_left_v12: [0.0, 0.054, -0.048, 90.0, 0.0, 0.0]
+  Tf_to_marker_left_v13: [0.097, 0.0, -0.005, 90.0, 0.0, -90.0]
+  Tf_to_marker_right: [0.00000, -0.05380, -0.04540, 90.00, 0.10, 180.00]
+  Tf_to_marker_right_v12: [0.0, -0.054, -0.048, 90.0,0.0, 180.0]
+  Tf_to_marker_right_v13: [0.097, 0.0, -0.005, 90.0, 0.0, -90.0]
+  camera_mount_link: link_head_2
+  fps: 30
+  head_base_to_cam: [0.102, 0.009, 0.044, -90.0, 0.0, -90.0]
+  height: 720
+  mount_to_cam: [0.047, 0.009, 0.057, -90.0, 0.0, -90.0] # [0.023, 0.0, 0.066,0.0,90.0,0.0]
+  width: 1280
+joint_offset:
+  left:
+    joint3: -0.7003098454303962
+    joint5: 2.9382722136151886
+    joint6: -3.499656272126595
+  right:
+    joint3: -0.4987899919579815
+    joint5: -5.460598380259994
+    joint6: -2.3489268063949744
+thermal_compensation:
+  enabled: false
+  baseline_temp: 32.0
+  focal_scale_per_deg: 0.00028
+  pp_x_shift_per_deg: 0.035
+  pp_y_shift_per_deg: -0.142
+
+marker:
+
+  plate:
+    left_ids:
+    - 7
+    right_ids:
+    - 8
+    plate_size_mm: 80.0
