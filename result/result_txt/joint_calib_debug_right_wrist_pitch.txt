@@ -1,0 +1,90 @@
+
+=== NEW ITERATION ===
+
+============================================================
+   STARTING ITERATIVE JOINT CALIBRATION SEQUENCE
+   Target Arm: RIGHT | Joint Target: WRIST_PITCH
+============================================================
+
+
+[ITERATION 1/6] Sweeping physically with staged offset 0.0000°...
+
+==================================================
+   STARTING WRIST_PITCH CONTINUOUS OFFSET CALIBRATION SWEEP
+==================================================
+[DEBUG] Saved Axis 4 debug points to sweep_points_right_joint_A_axis_4.txt
+[DEBUG] Saved Axis 6 debug points to sweep_points_right_joint_B_axis_6.txt
+
+==================================================
+   SWEEP ANALYSIS & RESULTS (WRIST_PITCH)
+==================================================
+  * Camera Circle Normals Angle (Reference): 5.3802 deg
+  * Circle Size Error (abs: r_A - r_B)     : 2.2424 mm
+  * Estimated Circle Center Distance       : 16.2001 mm
+  * Calculated Offset Correction           : -5.329788 deg
+==================================================
+  * Angle Error (Deviation)     : 5.3802°
+  * Circle Size Error (r_A-r_B) : 2.2424 mm
+  * Center Distance Error       : 16.2001 mm
+  * Max Fitting Error Metric    : 16.2001 mm
+  * Updated Absolute Offset     : -5.3298°
+
+[ITERATION 2/6] Sweeping physically with staged offset -5.3298°...
+
+==================================================
+   STARTING WRIST_PITCH CONTINUOUS OFFSET CALIBRATION SWEEP
+   [Baseline Shift (Current Applied Offset): -5.3298°]
+==================================================
+
+==================================================
+   SWEEP ANALYSIS & RESULTS (WRIST_PITCH)
+==================================================
+  * Camera Circle Normals Angle (Reference): 0.0886 deg
+  * Circle Size Error (abs: r_A - r_B)     : 0.0069 mm
+  * Estimated Circle Center Distance       : 0.2117 mm
+  * Calculated Offset Correction           : -0.071524 deg
+==================================================
+  * Angle Error (Deviation)     : 0.0886°
+  * Circle Size Error (r_A-r_B) : 0.0069 mm
+  * Center Distance Error       : 0.2117 mm
+  * Max Fitting Error Metric    : 0.2117 mm
+
+[SUCCESS] Calibration CONVERGED successfully:
+  * Step Correction: -0.0715° < 0.1° (reached resolution limit)
+  * Recommended Absolute Offset: -5.3298°
+[SUCCESS] Saved combined calibration comparison plot to: /home/rainbow/camera_ws/result/result_img/circle_fit_right_wrist_pitch_joint_calib.png
+
+=== NEW ITERATION ===
+
+============================================================
+   STARTING ITERATIVE JOINT CALIBRATION SEQUENCE
+   Target Arm: RIGHT | Joint Target: WRIST_PITCH
+============================================================
+
+
+[ITERATION 1/6] Sweeping physically with staged offset -5.3298°...
+
+==================================================
+   STARTING WRIST_PITCH CONTINUOUS OFFSET CALIBRATION SWEEP
+   [Baseline Shift (Current Applied Offset): -5.3298°]
+==================================================
+[DEBUG] Saved Axis 4 debug points to sweep_points_right_joint_A_axis_4.txt
+[DEBUG] Saved Axis 6 debug points to sweep_points_right_joint_B_axis_6.txt
+
+==================================================
+   SWEEP ANALYSIS & RESULTS (WRIST_PITCH)
+==================================================
+  * Camera Circle Normals Angle (Reference): 0.0763 deg
+  * Circle Size Error (abs: r_A - r_B)     : 0.0044 mm
+  * Estimated Circle Center Distance       : 0.2088 mm
+  * Calculated Offset Correction           : -0.067445 deg
+==================================================
+  * Angle Error (Deviation)     : 0.0763°
+  * Circle Size Error (r_A-r_B) : 0.0044 mm
+  * Center Distance Error       : 0.2088 mm
+  * Max Fitting Error Metric    : 0.2088 mm
+
+[SUCCESS] Calibration CONVERGED successfully:
+  * Step Correction: -0.0674° < 0.1° (reached resolution limit)
+  * Recommended Absolute Offset: -5.3298°
+[SUCCESS] Saved combined calibration comparison plot to: /home/rainbow/camera_ws/result/result_img/circle_fit_right_wrist_pitch_joint_calib.png

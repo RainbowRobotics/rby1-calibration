@@ -1,0 +1,5 @@
+PySide6
+numpy>=2.0.1
+opencv-python
+pyyaml
+scipy

@@ -1,0 +1,11 @@
+typeguard
+numpy>=2.0.1
+opencv-contrib-python==4.13.0.92
+rby1_sdk>=0.9.1
+scipy>=1.14.0
+matplotlib>=3.9.1
+pyrealsense2
+PySide6>=6.7.2
+qpsolvers[osqp]==4.11.0
+osqp==1.1.1
+pyyaml
