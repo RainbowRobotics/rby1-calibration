@@ -221,8 +221,8 @@ class IntrinsicsCalibrator:
         return success
 
     def _calibrate_and_validate(self, all_obj_points, all_img_points, img_size, all_ids):
-        if len(all_obj_points) < 5:
-            print(f"Not enough valid frames for calibration (detected {len(all_obj_points)} valid frames, minimum 5 required).")
+        if len(all_obj_points) < 16:
+            print(f"Not enough valid frames for calibration (detected {len(all_obj_points)} valid frames, minimum 16 required).")
             return False
 
         # Set up calibration flags

@@ -117,7 +117,9 @@ def build_incremental_motion_plan(robot, dyn_model, config: AutoCollectionConfig
     """
     reset_motion_state()
     state = robot.get_state()
-    q_full = state.position
+    if state is None or getattr(state, 'position', None) is None:
+        raise RuntimeError("Robot state position is None. Please check connection.")
+    q_full = np.array(state.position)
     _, T_base_right = compute_fk(robot, dyn_model, q_full, "ee_right", "link_torso_5")
     _, T_base_left = compute_fk(robot, dyn_model, q_full, "ee_left", "link_torso_5")
     
@@ -205,6 +207,24 @@ def build_incremental_motion_plan(robot, dyn_model, config: AutoCollectionConfig
                 "desc": f"Pos: ({dx:.3f},{dy:.3f},{dz:.3f})"
             })
             
+        # 4. Independent head motions (Pan Left/Right, Tilt Up/Down)
+        if q_head_0 is not None:
+            ang_rad = np.radians(config.angle_step_deg)
+            head_targets = [
+                (-ang_rad, 0.0, f"Head Pan: {-config.angle_step_deg:.1f}deg"),
+                (ang_rad, 0.0, f"Head Pan: {config.angle_step_deg:.1f}deg"),
+                (0.0, -ang_rad, f"Head Tilt: {-config.angle_step_deg:.1f}deg"),
+                (0.0, ang_rad, f"Head Tilt: {config.angle_step_deg:.1f}deg"),
+            ]
+            for d_pan, d_tilt, desc in head_targets:
+                hq = np.array([q_head_0[0] + d_pan, q_head_0[1] + d_tilt], dtype=np.float64)
+                plan.append({
+                    "T_right": T_curr_right.copy(),
+                    "T_left": T_curr_left.copy(),
+                    "head_q": hq,
+                    "desc": desc
+                })
+            
         T_curr_right = apply_cartesian_offset(T_curr_right, dx=config.step_x_m)
         T_curr_left = apply_cartesian_offset(T_curr_left, dx=config.step_x_m)
         
@@ -240,10 +260,10 @@ def move_to_auto_ready_pose(robot, active_arms, minimum_time=5.0, priority=10):
 
     # Step 2: Cartesian Checking Pose (go_to_calibration_checking_pose 기준, offset=0.2)
     # Raising Z-axis to 0.2m (down 20cm from previous 0.4m) and rotating 6th axis (wrist) by 180 degrees (@ rot_z(180))
-    T_right = make_T(rot_z(0*D2R) @ rot_y(-90*D2R) @ rot_x(90*D2R), [0.3, -0.2, 0.2])
+    T_right = make_T(rot_z(0*D2R) @ rot_y(-90*D2R) @ rot_x(90*D2R), [0.3, -0.15, 0.25])
     T_right[:3, :3] = T_right[:3, :3] @ rot_z(180*D2R)
     
-    T_left = make_T(rot_z(0*D2R) @ rot_y(-90*D2R) @ rot_x(-90*D2R), [0.3, 0.2, 0.2])
+    T_left = make_T(rot_z(0*D2R) @ rot_y(-90*D2R) @ rot_x(-90*D2R), [0.3, 0.15, 0.25])
     T_left[:3, :3] = T_left[:3, :3] @ rot_z(180*D2R)
 
     body2 = rby.BodyComponentBasedCommandBuilder()
@@ -369,7 +389,9 @@ def execute_auto_motion_step(robot, config, motion_plan_step, active_arms, inclu
 
     if step_type == "joint":
         state = robot.get_state()
-        q_full = state.position
+        if state is None or getattr(state, 'position', None) is None:
+            raise RuntimeError("Robot state position is None. Please check connection.")
+        q_full = np.array(state.position)
         model = robot.model()
         dyn_model = robot.get_dynamics()
 

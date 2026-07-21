@@ -20,7 +20,7 @@ You must remove the currently attached gripper and connect the marker plates **d
 ![Marker Stickers](img/marker_bracket.png) 
 ![Marker connect](img/marker_connect.png)   
 
-> **Note** if you need disassembly gripper, see [disassembly gripper](https://rainbowco-my.sharepoint.com/:p:/g/personal/support_rainbow-robotics_com/IQBQNoNxvENnSIt29V1aNsCCAYICOBKbsLJnAnvFFuTkA80?e=AEW1KM).
+> **Note** if you need disassembly gripper, see [disassembly gripper](https://rainbowco-my.sharepoint.com/:p:/g/personal/support_rainbow-robotics_com/IQD86a950aEVQqclH8O9vQxrAcXAZA4gEQ3921tDqwQIGH8?e=qRn473).
 
 
 
@@ -41,7 +41,7 @@ If you need to calibrate the camera's intrinsic parameters, you must use a check
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/JeonSangMin-sw2/camera_ws.git
+git clone https://github.com/RainbowRobotics/rby1-calibration.git
 cd camera_ws
 ```
 

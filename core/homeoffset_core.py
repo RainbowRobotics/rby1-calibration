@@ -131,6 +131,12 @@ def save_home_reset_baseline_json(
 
 
 def movej(robot, torso=None, right_arm=None, left_arm=None, head=None, minimum_time=5):
+    if head is not None:
+        model = robot.model()
+        has_head = hasattr(model, 'head_idx') and len(model.head_idx) > 0
+        if not has_head:
+            head = None
+
     rc = rby.BodyComponentBasedCommandBuilder()
 
     if right_arm is not None:
@@ -327,6 +333,99 @@ def move_to_offset_candidate_from_json(
     return result
 
 
+def validate_home_offset_joint_limits(robot, model, arm="both", include_head=True, log_cb=None):
+    """
+    Validates that setting home offset from the current pose will NOT cause any joint
+    to exceed its allowed physical joint limits when commanded to ready poses.
+    Returns (is_valid, error_message).
+    """
+    if robot is None or model is None:
+        return True, ""
+
+    try:
+        state = robot.get_state()
+        q_current = np.array(state.position, dtype=np.float64).reshape(-1)
+        
+        dyn_model = model.get_dynamics_model()
+        q_lower = np.array(dyn_model.get_limit_q_lower(state), dtype=np.float64).reshape(-1)
+        q_upper = np.array(dyn_model.get_limit_q_upper(state), dtype=np.float64).reshape(-1)
+        
+        # Load ready_poses.yaml if available
+        import yaml
+        config_dir = Path(__file__).resolve().parent.parent / "config"
+        yaml_path = config_dir / "ready_poses.yaml"
+        
+        ready_poses_dict = {}
+        if yaml_path.exists():
+            with open(yaml_path, "r") as f:
+                ready_poses_dict = yaml.safe_load(f) or {}
+
+        # Default ready pose targets (in degrees) if yaml fails
+        default_ready_deg = {
+            "right_arm": [-90.0, -40.0, 73.0, -97.0, 90.0, 90.0, -10.0],
+            "left_arm": [-90.0, 40.0, -73.0, -97.0, -80.0, 90.0, 10.0]
+        }
+        
+        # Collect ready poses to test (marker, joint, check_calib)
+        poses_to_check = []
+
+        for ver_key in ["v1.2", "v1.3"]:
+            if ver_key in ready_poses_dict:
+                ver_data = ready_poses_dict[ver_key]
+                if "marker" in ver_data:
+                    poses_to_check.append(("marker", ver_data["marker"]))
+                if "check_calib" in ver_data:
+                    poses_to_check.append(("check_calib", ver_data["check_calib"]))
+                if "joint" in ver_data:
+                    for mode_key, mode_data in ver_data["joint"].items():
+                        poses_to_check.append((f"joint_{mode_key}", mode_data))
+
+        if not poses_to_check:
+            poses_to_check = [("default_marker", default_ready_deg)]
+
+        # Check joint bounds for selected arms/head
+        joint_indices_to_check = []
+        if arm in ("right", "both"):
+            for i, idx in enumerate(model.right_arm_idx):
+                joint_indices_to_check.append((f"right_arm_{i}", idx, "right_arm", i))
+        if arm in ("left", "both"):
+            for i, idx in enumerate(model.left_arm_idx):
+                joint_indices_to_check.append((f"left_arm_{i}", idx, "left_arm", i))
+        if include_head and hasattr(model, 'head_idx'):
+            for i, idx in enumerate(model.head_idx):
+                joint_indices_to_check.append((f"head_{i}", idx, "head", i))
+
+        for pose_label, pose_data in poses_to_check:
+            for joint_name, idx, side, joint_i in joint_indices_to_check:
+                if side in pose_data and len(pose_data[side]) > joint_i:
+                    q_ready_val = np.radians(pose_data[side][joint_i])
+                    q_offset_val = q_current[idx]
+                    q_expected = q_ready_val + q_offset_val
+                    
+                    min_lim = q_lower[idx]
+                    max_lim = q_upper[idx]
+
+                    if q_expected < min_lim or q_expected > max_lim:
+                        exp_deg = np.degrees(q_expected)
+                        min_deg = np.degrees(min_lim)
+                        max_deg = np.degrees(max_lim)
+                        off_deg = np.degrees(q_offset_val)
+                        
+                        err_msg = (
+                            f"Joint '{joint_name}' angle {exp_deg:+.1f}° (ready {pose_data[side][joint_i]:+.1f}° + offset {off_deg:+.1f}°) "
+                            f"exceeds physical joint limits [{min_deg:+.1f}°, {max_deg:+.1f}°] under pose target '{pose_label}'!"
+                        )
+                        if log_cb:
+                            log_cb(f"[ERROR] {err_msg}")
+                        return False, err_msg
+
+        return True, ""
+    except Exception as e:
+        if log_cb:
+            log_cb(f"[WARN] Joint limit validation exception: {e}")
+        return True, ""
+
+
 def reset_current_pose_home_offsets(
     robot,
     model,
@@ -340,6 +439,22 @@ def reset_current_pose_home_offsets(
 
     if log_cb is not None:
         log_cb("Starting Home Offset Reset from current pose...")
+
+    # Safety Check: Validate joint limits against ready poses before performing reset
+    is_valid, err_msg = validate_home_offset_joint_limits(
+        robot, model, arm=arm, include_head=include_head, log_cb=log_cb
+    )
+    if not is_valid:
+        if log_cb is not None:
+            log_cb(f"[ERROR] Home Offset Reset aborted due to joint limit violation: {err_msg}")
+        return {
+            "status": "failed",
+            "success": False,
+            "arm": arm,
+            "include_head": bool(include_head),
+            "failed_joints": [],
+            "error": err_msg
+        }
 
     robot.disable_control_manager()
     time.sleep(0.5)
@@ -378,8 +493,8 @@ def reset_current_pose_home_offsets(
         time.sleep(2.0)
 
         if log_cb is not None:
-            log_cb("Powering off 48V power...")
-        robot.power_off("48v")
+            log_cb("Powering off overall power (.*)...")
+        robot.power_off(".*")
         time.sleep(1.5)
 
     return {

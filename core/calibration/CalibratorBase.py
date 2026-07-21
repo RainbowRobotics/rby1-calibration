@@ -17,16 +17,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 class BaseCalibrator:
     JOINT_CONFIGS = {
-        "wrist_roll_v13":  {"cand_joint": 6, "sweep_joint_A": 6, "sweep_joint_B": 5, "offset_key": "wrist_roll",  "offset_range": (-30.0, 30.0), "sweep_range_A": 20.0, "sweep_range_B": 20.0},
+        "wrist_roll_v13":  {"cand_joint": 6, "sweep_joint_A": 6, "sweep_joint_B": 5, "offset_key": "wrist_roll",  "offset_range": (-30.0, 30.0), "sweep_range_A": 25.0, "sweep_range_B": 20.0},
         "wrist_pitch_v13": {"cand_joint": 5, "sweep_joint_A": 5, "sweep_joint_B": 3, "offset_key": "wrist_pitch", "offset_range": (-30.0, 30.0), "sweep_range_A": 20.0, "sweep_range_B": 15.0},
-        "wrist_yaw2":      {"cand_joint": 6, "sweep_joint_A": 6, "sweep_joint_B": 5, "offset_key": "wrist_yaw2",  "offset_range": (-30.0, 30.0), "sweep_range_A": 20.0, "sweep_range_B": 20.0},
+        "wrist_yaw2":      {"cand_joint": 6, "sweep_joint_A": 6, "sweep_joint_B": 5, "offset_key": "wrist_yaw2",  "offset_range": (-30.0, 30.0), "sweep_range_A": 25.0, "sweep_range_B": 20.0},
         "wrist_pitch":     {"cand_joint": 5, "sweep_joint_A": 4, "sweep_joint_B": 6, "offset_key": "wrist_pitch", "offset_range": (-30.0, 30.0), "sweep_range_A": 20.0, "sweep_range_B": 20.0},
         "elbow":           {"cand_joint": 3, "sweep_joint_A": 2, "sweep_joint_B": 4, "offset_key": "elbow",       "offset_range": (-5.0, 0.0),   "sweep_range_A": 20.0, "sweep_range_B": 20.0},
     }
     MARKER_CONFIGS = {
         "axis_4": {"joint_i": 4, "start_deg": -15.0, "end_deg": 15.0, "n_nom_v12": [0.0, 0.0, 1.0], "n_nom_v13": [0.0, 0.0, 1.0]},
         "axis_5": {"joint_i": 5, "start_deg": -25.0, "end_deg": 25.0, "n_nom_v12": [0.0, 1.0, 0.0], "n_nom_v13": [0.0, 1.0, 0.0]},
-        "axis_6": {"joint_i": 6, "start_deg": -20.0, "end_deg": 20.0, "n_nom_v12": [0.0, 0.0, 1.0], "n_nom_v13": [1.0, 0.0, 0.0]},
+        "axis_6": {"joint_i": 6, "start_deg": -25.0, "end_deg": 25.0, "n_nom_v12": [0.0, 0.0, 1.0], "n_nom_v13": [1.0, 0.0, 0.0]},
     }
     MOCK_GT_OFFSETS = {
         "right": {
@@ -52,6 +52,10 @@ class BaseCalibrator:
             "joint6": 3.5,
             "bracket_pos": [0.001, 0.0005, -0.002], # meters
             "bracket_rpy": [0.1, 0.1, 0.0]        # degrees
+        },
+        "head": {
+            "pan": 0.8,    # degrees
+            "tilt": -1.5   # degrees
         }
     }
     NOMINAL_BRACKET_TEMPLATES = {
@@ -114,7 +118,10 @@ class BaseCalibrator:
         try:
             val = self.ready_poses[version_key]
             if type_key == "joint":
-                val = val["joint"][mode_key][f"{arm_side}_arm"]
+                lookup_key = mode_key
+                if lookup_key == "wrist_pitch_v13":
+                    lookup_key = "wrist_pitch"
+                val = val["joint"][lookup_key][f"{arm_side}_arm"]
             elif type_key == "check_calib":
                 val = val["check_calib"][f"{arm_side}_arm"]
             else:
@@ -373,6 +380,11 @@ class BaseCalibrator:
         for i in range(7):
             q_actual[arm_idx[i]] += np.radians(injected_joint_offsets_deg[i])
             
+        head_idx = model.head_idx if hasattr(model, 'head_idx') else []
+        if len(head_idx) >= 2:
+            head_gt = self.MOCK_GT_OFFSETS.get("head", {"pan": 0.0, "tilt": 0.0})
+            q_actual[head_idx[0]] += np.radians(head_gt.get("pan", 0.0))
+            q_actual[head_idx[1]] += np.radians(head_gt.get("tilt", 0.0))
 
         dyn_model = self.robot.get_dynamics()
         T_t5_to_ee = self.compute_fk(self.robot, dyn_model, q_actual, ee_name)
@@ -415,6 +427,12 @@ class BaseCalibrator:
         if not robot:
             return False
             
+        if head is not None:
+            model = robot.model()
+            has_head = hasattr(model, 'head_idx') and len(model.head_idx) > 0
+            if not has_head:
+                head = None
+
         if apply_offsets and hasattr(self, 'joint_offsets') and self.joint_offsets is not None:
             # Offset mapping: Joint 3 (index 3) is elbow
             # For v1.3:
@@ -996,7 +1014,7 @@ class BaseCalibrator:
             right_arm = None
             left_arm = self.get_ready_pose(version_key, type_key, ready_mode, "left")
 
-        success = self.movej(self.robot, torso=torso, right_arm=right_arm, left_arm=left_arm, head=[0, 0], minimum_time=5.0)
+        success = self.movej(self.robot, torso=torso, right_arm=right_arm, left_arm=left_arm, head=None, minimum_time=5.0)
         if success and log_callback:
             log_callback("[INFO] Ready Pose Reached.")
         return success

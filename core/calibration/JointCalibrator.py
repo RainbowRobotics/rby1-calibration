@@ -100,6 +100,7 @@ class JointCalibrator(BaseCalibrator):
                 
             max_iterations = 6
             staged_offset = current_offset_deg
+            staged_offsets_history = [staged_offset]
             final_res = None
             first_res = None
             converged = False
@@ -221,9 +222,18 @@ class JointCalibrator(BaseCalibrator):
                         log_callback(f"  [SAFETY WARNING] Staged offset {staged_offset:.4f}° exceeds safe bounds [{off_min}°, {off_max}°]. Clamping.")
                     staged_offset = float(np.clip(staged_offset, off_min, off_max))
                     
+                staged_offsets_history.append(staged_offset)
                 if log_callback:
                     log_callback(f"  * Updated Absolute Offset     : {staged_offset:.4f}°")
                     
+            # Damping fallback for oscillation/noise-floor:
+            if not converged and len(staged_offsets_history) >= 3:
+                avg_offset = float(np.mean(staged_offsets_history[-3:]))
+                if log_callback:
+                    log_callback(f"\n[INFO] Joint {mode} did not meet 0.1° convergence tolerance due to measurement noise floor.")
+                    log_callback(f"       Damping fallback: Averaged last 3 offsets ({', '.join(f'{v:.4f}°' for v in staged_offsets_history[-3:])}) -> {avg_offset:.4f}°")
+                staged_offset = avg_offset
+
             # Final range safety: clamp to configured offset_range
             jcfg = self.JOINT_CONFIGS.get(mode, {})
             off_min, off_max = jcfg.get('offset_range', (-10.0, 10.0))
@@ -1001,7 +1011,7 @@ class JointCalibrator(BaseCalibrator):
                 log_callback("[ERROR] Circle fitting failed or error is too large. Aborting step adjustment.")
             optimal_offset_deg = 0.0
         else:
-            if mode == "elbow":
+            if mode in ("elbow", "wrist_pitch"):
                 # Robust Center-Distance Method for parallel joints
                 # The normal vector of a small arc is highly sensitive to vibrations.
                 # However, the distance between the rotation centers is extremely robust and proportional to the angle error.
@@ -1038,8 +1048,6 @@ class JointCalibrator(BaseCalibrator):
                 else:
                     optimal_offset_deg = 0.0
                     
-            elif mode == "wrist_pitch":
-                optimal_offset_deg = - (angle_between_normals * sign)
             elif mode not in ("wrist_roll_v13", "wrist_yaw2"):
                 optimal_offset_deg = -np.degrees(diff_angle)
 

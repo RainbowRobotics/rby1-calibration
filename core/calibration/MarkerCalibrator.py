@@ -685,6 +685,12 @@ class MarkerCalibrator(BaseCalibrator):
                 else:
                     theta_6 = 0.0
 
+            # Correct J6 joint offset if available
+            if hasattr(self, 'joint_offsets') and self.joint_offsets:
+                offsets = self.joint_offsets[arm_side] if arm_side in self.joint_offsets else self.joint_offsets
+                offset_val = offsets.get("wrist_roll" if self.is_v13() else "wrist_yaw2", 0.0)
+                theta_6 -= np.radians(offset_val)
+
             if marker_data_4 is not None:
                 # --- 3-Axis SVD Alignment (Using Joint 4, 5, and 6) ---
                 poses_4 = marker_data_4.get('captured_poses', [])
@@ -711,6 +717,12 @@ class MarkerCalibrator(BaseCalibrator):
                         theta_6_4 = np.mean([q[q_idx] for q in q_full_4])
                     else:
                         theta_6_4 = 0.0
+
+                # Correct J6 joint offset if available
+                if hasattr(self, 'joint_offsets') and self.joint_offsets:
+                    offsets = self.joint_offsets[arm_side] if arm_side in self.joint_offsets else self.joint_offsets
+                    offset_val = offsets.get("wrist_roll" if self.is_v13() else "wrist_yaw2", 0.0)
+                    theta_6_4 -= np.radians(offset_val)
 
                 z_col = n6_marker_actual
                 
@@ -792,8 +804,7 @@ class MarkerCalibrator(BaseCalibrator):
         from scipy.optimize import least_squares
         if marker_data_4 is not None:
             def residuals_trans(params):
-                ye, ze = params
-                xe = x_nom
+                xe, ye, ze = params
                 r6_pred = np.sqrt(xe**2 + ye**2)
                 Z_prime = ze + z_sign * L_5_ee
                 r5_pred = np.sqrt(xe**2 + Z_prime**2)
@@ -807,16 +818,16 @@ class MarkerCalibrator(BaseCalibrator):
                     r4_pred - radius_4
                 ]
                 reg_weight = 1e-7
+                res.append(reg_weight * (xe - x_nom))
                 res.append(reg_weight * (ye - y_nom))
                 res.append(reg_weight * (ze - z_nom))
                 return res
 
-            initial_guess = [y_nom, z_nom]
-            lower_bounds = [y_nom - 30.0, -250.0]
-            upper_bounds = [y_nom + 30.0, 10.0]
+            initial_guess = [x_nom, y_nom, z_nom]
+            lower_bounds = [x_nom - 30.0, y_nom - 30.0, -250.0]
+            upper_bounds = [x_nom + 30.0, y_nom + 30.0, 10.0]
             opt_res = least_squares(residuals_trans, initial_guess, bounds=(lower_bounds, upper_bounds), loss='huber')
-            y_e, z_e = opt_res.x
-            x_e = x_nom
+            x_e, y_e, z_e = opt_res.x
         else:
             def residuals_trans(params):
                 ye, ze = params

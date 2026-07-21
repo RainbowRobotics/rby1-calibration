@@ -201,7 +201,9 @@ def create_live_marker_transform():
 
 def capture_one_sample(robot, arm_idx, marker_transform, sampling_time=1, side="all", head_idx=None):
     state = robot.get_state()
-    q_full = state.position.copy()
+    if state is None or getattr(state, 'position', None) is None:
+        return None, None, None
+    q_full = np.array(state.position)
     q_arm = q_full[arm_idx].copy()
     q_head = q_full[head_idx].copy() if head_idx is not None else None
 

@@ -390,7 +390,8 @@ class ApplyHomeOffsetDialog(QDialog):
         self.baseline_path = baseline_path
         self.arm = arm
         self.include_head = include_head
-        
+        self._drag_pos = None
+
         self.current_apply_arm = parent.infer_home_offset_apply_arm(arm, result_path)
         
         if compare_summary is None:
@@ -490,6 +491,22 @@ class ApplyHomeOffsetDialog(QDialog):
         
         layout.addLayout(btn_layout)
         self.setLayout(layout)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+            self._drag_pos = pos - self.frameGeometry().topLeft()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.LeftButton and hasattr(self, '_drag_pos') and self._drag_pos is not None:
+            pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+            self.move(pos - self._drag_pos)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
         
     def on_apply_selected(self):
         state, path = self.get_current_target()
@@ -577,7 +594,8 @@ class ApplyHomeOffsetDialog(QDialog):
             self.parent_app,
             "apply",
             arm=self.current_apply_arm,
-            include_head=self.include_head
+            include_head=self.include_head,
+            json_path=self.result_path if state == "optimized" else None
         )
         self.worker.log_signal.connect(self.parent_app.log_msg)
         def on_finished(success, error_msg, res):
@@ -585,6 +603,9 @@ class ApplyHomeOffsetDialog(QDialog):
             if success:
                 if res.get("needs_reconnect", False):
                     self.parent_app.log_msg("Re-connecting and initializing robot...")
+                    if self.parent_app.robot:
+                        self.parent_app.connect_robot()
+                        QApplication.processEvents()
                     self.parent_app.connect_robot()
                     self.parent_app.log_msg("Current pose home offset apply complete.")
                     
@@ -1061,7 +1082,8 @@ class Step2ApplyHomeOffsetWorker(QThread):
             elif self.task_type == "apply":
                 res = self.app.apply_current_pose_home_offset(
                     self.kwargs["arm"],
-                    self.kwargs["include_head"]
+                    self.kwargs["include_head"],
+                    json_path=self.kwargs.get("json_path")
                 )
                 self.finished_signal.emit(True, "", res)
         except Exception as e:
@@ -1333,7 +1355,7 @@ class MarkerCalibrationWorker(QThread):
                         torso=[0.0]*6,
                         right_arm=first_starting_pose if self.arm_side == "right" else None,
                         left_arm=first_starting_pose if self.arm_side == "left" else None,
-                        head=[0, 0],
+                        head=None,
                         minimum_time=5.0,
                         apply_offsets=False
                     )
@@ -1398,7 +1420,7 @@ class MarkerCalibrationWorker(QThread):
                     torso=[0.0]*6,
                     right_arm=first_starting_pose if self.arm_side == "right" else None,
                     left_arm=first_starting_pose if self.arm_side == "left" else None,
-                    head=[0, 0],
+                    head=None,
                     minimum_time=5.0,
                     apply_offsets=False
                 )
@@ -1552,14 +1574,22 @@ class SimulatedMarkerTransform:
             q_actual[arm_idx[5]] += np.radians(j5_gt)
             q_actual[arm_idx[3]] += np.radians(j3_gt)
                     
+            # Apply simulated head joint offsets to head kinematics to match real-robot uncalibrated state
+            q_actual_head = np.array(q)
+            head_idx = model.head_idx if hasattr(model, 'head_idx') else []
+            if len(head_idx) >= 2:
+                head_gt = BaseCalibrator.MOCK_GT_OFFSETS.get("head", {"pan": 0.0, "tilt": 0.0})
+                q_actual_head[head_idx[0]] += np.radians(head_gt.get("pan", 0.0))
+                q_actual_head[head_idx[1]] += np.radians(head_gt.get("tilt", 0.0))
+                    
             T_t5_to_ee = BaseCalibrator.compute_fk(self.robot, dyn_model, q_actual, ee_name, "link_torso_5")
             
             try:
-                T_t5_to_head = BaseCalibrator.compute_fk(self.robot, dyn_model, q, "link_head_2", "link_torso_5")
+                T_t5_to_head = BaseCalibrator.compute_fk(self.robot, dyn_model, q_actual_head, "link_head_2", "link_torso_5")
             except Exception:
                 try:
                     # Try alternative link name for v1.2 head camera mount
-                    T_t5_to_head = BaseCalibrator.compute_fk(self.robot, dyn_model, q, "link_head", "link_torso_5")
+                    T_t5_to_head = BaseCalibrator.compute_fk(self.robot, dyn_model, q_actual_head, "link_head", "link_torso_5")
                 except Exception:
                     T_t5_to_head = np.eye(4)
             
@@ -1700,10 +1730,10 @@ class FullAutoWorker(QThread):
                                 first_starting_pose = list(state.position[arm_idx])
                                 if arm_side == "right":
                                     self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, left_arm=[0.0]*7, head=None, minimum_time=3.0, apply_offsets=False)
-                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, right_arm=first_starting_pose, head=[0, 0], minimum_time=5.0, apply_offsets=False)
+                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, right_arm=first_starting_pose, head=None, minimum_time=5.0, apply_offsets=False)
                                 else:
                                     self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, right_arm=[0.0]*7, head=None, minimum_time=3.0, apply_offsets=False)
-                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, left_arm=first_starting_pose, head=[0, 0], minimum_time=5.0, apply_offsets=False)
+                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, left_arm=first_starting_pose, head=None, minimum_time=5.0, apply_offsets=False)
                             else:
                                 self.log_msg.emit("[FULL AUTO] [MOCK] Returning to Initial Starting Pose...")
                                 time.sleep(1.0)
@@ -1727,10 +1757,10 @@ class FullAutoWorker(QThread):
                                 first_starting_pose = list(state.position[arm_idx])
                                 if arm_side == "right":
                                     self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, left_arm=[0.0]*7, head=None, minimum_time=3.0, apply_offsets=False)
-                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, right_arm=first_starting_pose, head=[0, 0], minimum_time=5.0, apply_offsets=False)
+                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, right_arm=first_starting_pose, head=None, minimum_time=5.0, apply_offsets=False)
                                 else:
                                     self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, right_arm=[0.0]*7, head=None, minimum_time=3.0, apply_offsets=False)
-                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, left_arm=first_starting_pose, head=[0, 0], minimum_time=5.0, apply_offsets=False)
+                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, left_arm=first_starting_pose, head=None, minimum_time=5.0, apply_offsets=False)
                             else:
                                 self.log_msg.emit("[FULL AUTO] [MOCK] Returning to Initial Starting Pose...")
                                 time.sleep(1.0)
@@ -1770,10 +1800,10 @@ class FullAutoWorker(QThread):
                                 first_starting_pose = list(state.position[arm_idx])
                                 if arm_side == "right":
                                     self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, left_arm=[0.0]*7, head=None, minimum_time=3.0, apply_offsets=False)
-                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, right_arm=first_starting_pose, head=[0, 0], minimum_time=5.0, apply_offsets=False)
+                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, right_arm=first_starting_pose, head=None, minimum_time=5.0, apply_offsets=False)
                                 else:
                                     self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, right_arm=[0.0]*7, head=None, minimum_time=3.0, apply_offsets=False)
-                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, left_arm=first_starting_pose, head=[0, 0], minimum_time=5.0, apply_offsets=False)
+                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, left_arm=first_starting_pose, head=None, minimum_time=5.0, apply_offsets=False)
                             else:
                                 self.log_msg.emit("[FULL AUTO] [MOCK] Returning to Initial Starting Pose...")
                                 time.sleep(1.0)
@@ -1797,10 +1827,10 @@ class FullAutoWorker(QThread):
                                 first_starting_pose = list(state.position[arm_idx])
                                 if arm_side == "right":
                                     self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, left_arm=[0.0]*7, head=None, minimum_time=3.0, apply_offsets=False)
-                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, right_arm=first_starting_pose, head=[0, 0], minimum_time=5.0, apply_offsets=False)
+                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, right_arm=first_starting_pose, head=None, minimum_time=5.0, apply_offsets=False)
                                 else:
                                     self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, right_arm=[0.0]*7, head=None, minimum_time=3.0, apply_offsets=False)
-                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, left_arm=first_starting_pose, head=[0, 0], minimum_time=5.0, apply_offsets=False)
+                                    self.marker_calibrator.movej(self.marker_calibrator.robot, torso=[0.0]*6, left_arm=first_starting_pose, head=None, minimum_time=5.0, apply_offsets=False)
                             else:
                                 self.log_msg.emit("[FULL AUTO] [MOCK] Returning to Initial Starting Pose...")
                                 time.sleep(1.0)
@@ -2440,6 +2470,7 @@ class UnifiedCalibrationApp(QWidget):
         self.chk_servo_head = QCheckBox("Head")
         self.chk_servo_head.setChecked(True)
         self.chk_servo_head.setStyleSheet("color: #cccccc;")
+        self.chk_servo_head.toggled.connect(self.on_head_checkbox_changed)
         connect_head_row.addWidget(self.chk_servo_head)
         conn_head_layout.addLayout(connect_head_row)
         
@@ -2928,10 +2959,21 @@ class UnifiedCalibrationApp(QWidget):
         overview_layout = QVBoxLayout()
         overview_layout.setContentsMargins(20, 20, 20, 20)
         
-        overview_title = QLabel("Calibration Process Overview")
-        overview_title.setStyleSheet("font-size: 24px; font-weight: bold; color: #ffeb3b;")
-        overview_title.setAlignment(Qt.AlignCenter)
-        overview_layout.addWidget(overview_title)
+        self.overview_title = QLabel("Calibration Process Overview")
+        self.overview_title.setStyleSheet("font-size: 24px; font-weight: bold; color: #ffeb3b;")
+        self.overview_title.setAlignment(Qt.AlignCenter)
+        overview_layout.addWidget(self.overview_title)
+        
+        self.overview_link = QLabel('GitHub Repository: <a href="https://github.com/RainbowRobotics/rby1-calibration" style="color: #00e5ff; font-weight: bold;">https://github.com/RainbowRobotics/rby1-calibration</a>')
+        self.overview_link.setStyleSheet("font-size: 15px;")
+        self.overview_link.setAlignment(Qt.AlignCenter)
+        self.overview_link.setOpenExternalLinks(True)
+        overview_layout.addWidget(self.overview_link)
+        
+        self.overview_duration = QLabel("Estimated Execution Time: ~40 minutes")
+        self.overview_duration.setStyleSheet("font-size: 16px; font-weight: bold; color: #00e5ff;")
+        self.overview_duration.setAlignment(Qt.AlignCenter)
+        overview_layout.addWidget(self.overview_duration)
         
         self.overview_img = QLabel()
         process_pix = QPixmap("img/process.png")
@@ -3262,6 +3304,10 @@ class UnifiedCalibrationApp(QWidget):
             except Exception:
                 pass
 
+    def on_head_checkbox_changed(self, checked):
+        self.include_head_motion = checked
+        self.log_msg(f"[INFO] Head motion/optimization option: {checked}")
+
     def connect_robot(self):
         from core.calibration.CalibratorBase import BaseCalibrator
 
@@ -3303,9 +3349,15 @@ class UnifiedCalibrationApp(QWidget):
             from PySide6.QtWidgets import QApplication
             QApplication.processEvents()
             
-            # 1. Create and connect robot
+            # 1. Create and connect robot (with auto-retry safety guard)
             robot = rby.create_robot(addr, model)
-            if not robot.connect():
+            connected = robot.connect()
+            if not connected:
+                self.log_msg("[WARN] Initial connection attempt failed. Waiting 1.0s before retrying...")
+                time.sleep(1.0)
+                connected = robot.connect()
+
+            if not connected:
                 raise ConnectionError(f"Failed to connect robot at {addr}")
             time.sleep(1)
 
@@ -3379,17 +3431,6 @@ class UnifiedCalibrationApp(QWidget):
                 self.dyn_model = self.robot.get_dynamics()
                 self.marker_calibrator.robot = self.robot
                 self.joint_calibrator.robot = self.robot
-                
-                # Check for head presence
-                if len(self.model.head_idx) == 0:
-                    if hasattr(self, 'chk_servo_head'):
-                        self.chk_servo_head.setChecked(False)
-                        self.chk_servo_head.setEnabled(False)
-                    self.include_head_motion = False
-                    self.log_msg("[INFO] No head joints detected. Head motion disabled (Torso base).")
-                else:
-                    if hasattr(self, 'chk_servo_head'):
-                        self.chk_servo_head.setEnabled(True)
                 
                 # Determine version classification automatically
                 detected_version = "1.2"
@@ -3521,6 +3562,12 @@ class UnifiedCalibrationApp(QWidget):
             self.btn_monitor.setStyleSheet("")
 
     def show_wizard_ui(self):
+        if hasattr(self, 'overview_title') and self.overview_title:
+            self.overview_title.setVisible(False)
+        if hasattr(self, 'overview_link') and self.overview_link:
+            self.overview_link.setVisible(False)
+        if hasattr(self, 'overview_duration') and self.overview_duration:
+            self.overview_duration.setVisible(False)
         self.overview_img.setVisible(False)
         self.btn_start_wizard.setVisible(False)
         self.wizard_widget.setVisible(True)
@@ -3550,6 +3597,8 @@ class UnifiedCalibrationApp(QWidget):
             self.status_label.setStyleSheet("color: #ff1744;")
 
     def poll_camera_status(self):
+        if self.ui_only or self.marker_st is None:
+            return
         # Camera Tab이 켜져있을 때는 poll_camera_status 생략 (update_video_frame이 처리함)
         if self.left_tabs.currentIndex() == 1 and hasattr(self, 'step1_tabs') and self.step1_tabs.currentIndex() == 1:
             return
@@ -4023,7 +4072,7 @@ class UnifiedCalibrationApp(QWidget):
         self.log_msg("Preview move complete. Inspect the robot pose before applying.")
         return result
 
-    def apply_current_pose_home_offset(self, arm, include_head):
+    def apply_current_pose_home_offset(self, arm, include_head, json_path=None):
         self.ensure_home_offset_robot()
         result = reset_current_pose_home_offsets(
             self.robot,
@@ -4032,10 +4081,37 @@ class UnifiedCalibrationApp(QWidget):
             include_head=include_head,
         )
 
+        # If camera was optimized, save the new camera pose to setting.yaml
+        if json_path is not None and os.path.exists(json_path):
+            try:
+                import json
+                with open(json_path, "r") as f:
+                    data = json.load(f)
+                
+                mount_to_cam_new = data.get("mount_to_cam_new")
+                head_base_to_cam_new = data.get("head_base_to_cam_new")
+                
+                if mount_to_cam_new or head_base_to_cam_new:
+                    config_path = CONFIG_PATHS["setting_yaml"]
+                    if os.path.exists(config_path):
+                        with open(config_path, "r") as f:
+                            lines = f.readlines()
+                        
+                        if mount_to_cam_new:
+                            self.log_msg(f"[APPLY] Saving optimized mount_to_cam to setting.yaml: {mount_to_cam_new}")
+                            self._update_camera_key_in_lines(lines, "mount_to_cam", mount_to_cam_new)
+                        if head_base_to_cam_new:
+                            self.log_msg(f"[APPLY] Saving optimized head_base_to_cam to setting.yaml: {head_base_to_cam_new}")
+                            self._update_camera_key_in_lines(lines, "head_base_to_cam", head_base_to_cam_new)
+                            
+                        with open(config_path, "w") as f:
+                            f.writelines(lines)
+            except Exception as e:
+                self.log_msg(f"[ERROR] Failed to save optimized camera pose to setting.yaml: {e}")
+
         # Robot reconnection should be done in the main thread to avoid GUI thread safety issues.
         # We will signal the caller to handle the reconnection.
         result['needs_reconnect'] = True
-        return result
         return result
 
     def run_auto_motion_step_blocking(self):
@@ -4064,8 +4140,14 @@ class UnifiedCalibrationApp(QWidget):
         if self.include_head_motion and self.auto_base_head_q is None:
             head_cfg = get_head_config(self.model)
             if head_cfg["head_idx"] is not None:
-                self.auto_base_head_q = self.robot.get_state().position[head_cfg["head_idx"]].copy()
-                self.log_msg(f"Auto base head pose (deg): {np.round(np.rad2deg(self.auto_base_head_q), 3)}")
+                state = self.robot.get_state()
+                if state is not None and getattr(state, 'position', None) is not None:
+                    q_full = np.array(state.position)
+                    self.auto_base_head_q = q_full[head_cfg["head_idx"]].copy()
+                    self.log_msg(f"Auto base head pose (deg): {np.round(np.rad2deg(self.auto_base_head_q), 3)}")
+                else:
+                    self.auto_base_head_q = None
+                    self.include_head_motion = False
             else:
                 self.auto_base_head_q = None
                 self.include_head_motion = False
@@ -4252,7 +4334,10 @@ class UnifiedCalibrationApp(QWidget):
         # In sim mode bypass camera and return dummy marker data
         if self.step2_mode_sel.currentText() == "sim":
             state = self.robot.get_state()
-            q_full = state.position.copy()
+            if state is None or getattr(state, 'position', None) is None:
+                self.log_msg("[ERROR] Sim mode: Robot state position is None.")
+                return None, None, None
+            q_full = np.array(state.position)
             q_arm = q_full[cfg["arm_idx"]].copy()
             q_head = q_full[head_idx].copy() if head_idx is not None else None
             # MOCK_GT_OFFSETS 및 기구학 모델(FK)을 반영한 현실적인 가상 마커 포즈 생성
@@ -4340,7 +4425,7 @@ class UnifiedCalibrationApp(QWidget):
 
         if solver_type == "QP Solver":
             if optimize_head and optimize_camera:
-                self.log_msg("\n[INFO] === 1-PASS QP: Optimizing Arm + Head + Camera Trans (Camera Rot locked) ===")
+                self.log_msg("\n[INFO] === 2-PASS QP Refinement: Optimizing Arm + Head + Camera Trans (Camera Rot locked) ===")
                 actual_lambda_cam_rot = 1e6
             else:
                 actual_lambda_cam_rot = lambda_cam_rot
@@ -4363,10 +4448,21 @@ class UnifiedCalibrationApp(QWidget):
                 apply_joint_offset_limits=apply_limits,
                 joint_offsets_to_apply=joint_offsets,
             )
+            # Pass 1: Initial optimization pass
             q_arm_offset, q_head_offset, xi_cam, mount_to_cam_new, head_base_to_cam_new = optimizer.optimize(
                 q_arm_list,
                 q_head_list,
                 T_meas_list,
+            )
+            # Pass 2: Refinement pass using Pass 1 results as initial guess for tight convergence
+            self.log_msg("[INFO] Running 2nd Pass QP Refinement for sub-millimeter precision...")
+            q_arm_offset, q_head_offset, xi_cam, mount_to_cam_new, head_base_to_cam_new = optimizer.optimize(
+                q_arm_list,
+                q_head_list,
+                T_meas_list,
+                q_arm_offset_init=q_arm_offset,
+                q_head_offset_init=q_head_offset,
+                xi_mount_cam_init=xi_cam,
             )
         else:
             optimizer = CalibrationOptimizer(
@@ -4436,6 +4532,10 @@ class UnifiedCalibrationApp(QWidget):
             "xi_cam": np.array(xi_cam).tolist(),
             "measurement_noise": optimizer.noise_estimator.as_dict(),
         }
+        if mount_to_cam_new is not None:
+            result_dict["mount_to_cam_new"] = mount_to_cam_new
+        if head_base_to_cam_new is not None:
+            result_dict["head_base_to_cam_new"] = head_base_to_cam_new
 
         if self.last_home_reset_path is not None and Path(self.last_home_reset_path).exists():
             result_dict["home_reset_baseline_path"] = str(self.last_home_reset_path)
@@ -4502,6 +4602,35 @@ class UnifiedCalibrationApp(QWidget):
         self.zero_pose_worker.finished_signal.connect(on_finished)
         self.zero_pose_worker.start()
 
+    def move_to_zero_pose(self):
+        self.log_msg("[Wizard 3-1] Move to Zero Pose requested.")
+        if not self.robot:
+            self.log_msg("[ERROR] Robot is not connected!")
+            return False
+            
+        self.zero_pose_worker = Step2ZeroPoseCheckWorker(
+            self.robot,
+            self.model,
+            "both",
+            self.include_head_motion
+        )
+        self.zero_pose_worker.log_signal.connect(self.log_msg)
+        def on_finished(success, error_msg):
+            if hasattr(self, 'wizard_widget') and self.wizard_widget is not None:
+                self.wizard_widget.set_wizard_busy(False)
+                if success:
+                    self.wizard_widget.mark_step_completed(5, True, "Moved to Zero Position")
+                else:
+                    self.wizard_widget.mark_step_completed(5, False, error_msg)
+
+            if success:
+                self.log_msg("[Wizard 3-1] Robot moved to zero pose successfully.")
+            else:
+                self.log_msg(f"[Wizard 3-1] Failed to move to zero pose: {error_msg}")
+        self.zero_pose_worker.finished_signal.connect(on_finished)
+        self.zero_pose_worker.start()
+        return True
+
     def step2_stop_auto_motion(self):
         self.log_msg("[Step2] Stop Auto Motion requested.")
         self.request_stop_all_auto_motion()
@@ -4544,8 +4673,13 @@ class UnifiedCalibrationApp(QWidget):
                 if self.include_head_motion:
                     head_cfg = get_head_config(self.model)
                     if head_cfg["head_idx"] is not None:
-                        self.auto_base_head_q = self.robot.get_state().position[head_cfg["head_idx"]].copy()
-                        self.log_msg(f"Auto base head pose (deg): {np.round(np.rad2deg(self.auto_base_head_q), 3)}")
+                        state = self.robot.get_state()
+                        if state is not None and getattr(state, 'position', None) is not None:
+                            q_full = np.array(state.position)
+                            self.auto_base_head_q = q_full[head_cfg["head_idx"]].copy()
+                            self.log_msg(f"Auto base head pose (deg): {np.round(np.rad2deg(self.auto_base_head_q), 3)}")
+                        else:
+                            self.auto_base_head_q = None
                     else:
                         self.auto_base_head_q = None
                         self.include_head_motion = False
@@ -4587,6 +4721,17 @@ class UnifiedCalibrationApp(QWidget):
 
     def step2_calculate(self):
         self.log_msg("[Step2] Calculate requested.")
+        
+        # Check if calculation is already running
+        if hasattr(self, 'calc_worker') and self.calc_worker is not None and self.calc_worker.isRunning():
+            self.log_msg("[Step2] [WARNING] Optimization calculation is ALREADY running!")
+            QMessageBox.information(
+                self,
+                "Calculation In Progress",
+                "Optimization calculation is already running in the background.\n\nPlease wait for the current calculation to complete."
+            )
+            return
+
         if not self.robot:
             self.log_msg("[ERROR] Robot is not connected!")
             return
@@ -4654,6 +4799,14 @@ class UnifiedCalibrationApp(QWidget):
                             
             dataset_path, result_path = self.build_output_paths()
             
+            # Disable calculate button and update UI status
+            if hasattr(self, 'btn_step2_calculate') and self.btn_step2_calculate is not None:
+                self.btn_step2_calculate.setEnabled(False)
+                self.btn_step2_calculate.setText("Calculating...")
+                self.btn_step2_calculate.setStyleSheet("background-color: #f57c00; color: white; font-weight: bold;")
+
+            self.log_msg("[Step2] Optimization calculation started in background thread...")
+
             self.calc_worker = Step2CalculateWorker(
                 self,
                 active_arms,
@@ -4667,17 +4820,33 @@ class UnifiedCalibrationApp(QWidget):
                 lambda_cam_rot
             )
             self.calc_worker.log_signal.connect(self.log_msg)
+            
             def on_finished(success, error_msg):
+                if hasattr(self, 'btn_step2_calculate') and self.btn_step2_calculate is not None:
+                    self.btn_step2_calculate.setEnabled(True)
+                    self.btn_step2_calculate.setText("3) Calculate")
+                    self.btn_step2_calculate.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;")
+
+                if hasattr(self, 'wizard_widget') and self.wizard_widget is not None:
+                    self.wizard_widget.stop_step5(success, error_msg if not success else "")
+
                 if success:
                     self.log_msg("Optimization finished successfully.")
                     QMessageBox.information(self, "Step 2 Calculation", "Optimization finished successfully!\nCheck the logs and Result Output for details.")
                 else:
                     self.log_msg(f"[Error] Optimization failed: {error_msg}")
                     QMessageBox.warning(self, "Step 2 Calculation Failed", f"Optimization failed:\n{error_msg}")
+
             self.calc_worker.finished_signal.connect(on_finished)
             self.calc_worker.start()
             
         except Exception as e:
+            if hasattr(self, 'btn_step2_calculate') and self.btn_step2_calculate is not None:
+                self.btn_step2_calculate.setEnabled(True)
+                self.btn_step2_calculate.setText("3) Calculate")
+                self.btn_step2_calculate.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;")
+            QMessageBox.critical(self, "Calculate Error", str(e))
+            self.log_msg(f"Calculate failed: {e}")
             QMessageBox.critical(self, "Calculate Error", str(e))
             self.log_msg(f"Calculate failed: {e}")
 
@@ -4710,7 +4879,12 @@ class UnifiedCalibrationApp(QWidget):
             
             compare_summary = self.format_home_offset_compare_summary(result_path, baseline_path)
             
-            dialog = ApplyHomeOffsetDialog(
+            if hasattr(self, 'apply_offset_dialog') and self.apply_offset_dialog is not None and self.apply_offset_dialog.isVisible():
+                self.apply_offset_dialog.raise_()
+                self.apply_offset_dialog.activateWindow()
+                return
+
+            self.apply_offset_dialog = ApplyHomeOffsetDialog(
                 parent=self,
                 result_path=result_path,
                 baseline_path=baseline_path,
@@ -4718,7 +4892,9 @@ class UnifiedCalibrationApp(QWidget):
                 include_head=self.include_head_motion,
                 compare_summary=compare_summary
             )
-            dialog.exec()
+            self.apply_offset_dialog.show()
+            self.apply_offset_dialog.raise_()
+            self.apply_offset_dialog.activateWindow()
             
         except Exception as e:
             QMessageBox.critical(self, "Apply Home Offset Error", str(e))
@@ -4884,6 +5060,45 @@ class UnifiedCalibrationApp(QWidget):
         except Exception as e:
             self.log_msg(f"[ERROR] Failed to load setting.yaml: {e}")
 
+    def _update_camera_key_in_lines(self, lines_list, key_str, new_vals_list):
+        camera_idx = -1
+        for idx, line in enumerate(lines_list):
+            if line.strip().startswith("camera:"):
+                camera_idx = idx
+                break
+        
+        new_val_str = f"[{new_vals_list[0]:.5f}, {new_vals_list[1]:.5f}, {new_vals_list[2]:.5f}, {new_vals_list[3]:.2f}, {new_vals_list[4]:.2f}, {new_vals_list[5]:.2f}]"
+        key_found = False
+        if camera_idx != -1:
+            i = camera_idx + 1
+            while i < len(lines_list):
+                line = lines_list[i]
+                stripped = line.strip()
+                if not stripped:
+                    i += 1
+                    continue
+                if not line.startswith(" ") and not line.startswith("\t") and stripped.endswith(":"):
+                    break
+                
+                if stripped.startswith(f"{key_str}:"):
+                    comment = ""
+                    if "#" in line:
+                        comment_idx = line.find("#")
+                        comment = " " + line[comment_idx:].rstrip()
+                    
+                    indent = len(line) - len(line.lstrip())
+                    lines_list[i] = " " * indent + f"{key_str}: {new_val_str}{comment}\n"
+                    key_found = True
+                    break
+                i += 1
+        
+        if not key_found:
+            if camera_idx == -1:
+                lines_list.append("camera:\n")
+                lines_list.append(f"  {key_str}: {new_val_str}\n")
+            else:
+                lines_list.insert(camera_idx + 1, f"  {key_str}: {new_val_str}\n")
+
     def apply_bracket_design_values(self, silent=False):
         config_path = CONFIG_PATHS["setting_yaml"]
         try:
@@ -4911,47 +5126,8 @@ class UnifiedCalibrationApp(QWidget):
                 with open(config_path, "r") as f:
                     lines = f.readlines()
             
-            def update_key_in_lines(lines_list, key_str, new_vals_list):
-                camera_idx = -1
-                for idx, line in enumerate(lines_list):
-                    if line.strip().startswith("camera:"):
-                        camera_idx = idx
-                        break
-                
-                new_val_str = f"[{new_vals_list[0]:.5f}, {new_vals_list[1]:.5f}, {new_vals_list[2]:.5f}, {new_vals_list[3]:.2f}, {new_vals_list[4]:.2f}, {new_vals_list[5]:.2f}]"
-                key_found = False
-                if camera_idx != -1:
-                    i = camera_idx + 1
-                    while i < len(lines_list):
-                        line = lines_list[i]
-                        stripped = line.strip()
-                        if not stripped:
-                            i += 1
-                            continue
-                        if not line.startswith(" ") and not line.startswith("\t") and stripped.endswith(":"):
-                            break
-                        
-                        if stripped.startswith(f"{key_str}:"):
-                            comment = ""
-                            if "#" in line:
-                                comment_idx = line.find("#")
-                                comment = " " + line[comment_idx:].rstrip()
-                            
-                            indent = len(line) - len(line.lstrip())
-                            lines_list[i] = " " * indent + f"{key_str}: {new_val_str}{comment}\n"
-                            key_found = True
-                            break
-                        i += 1
-                
-                if not key_found:
-                    if camera_idx == -1:
-                        lines_list.append("camera:\n")
-                        lines_list.append(f"  {key_str}: {new_val_str}\n")
-                    else:
-                        lines_list.insert(camera_idx + 1, f"  {key_str}: {new_val_str}\n")
-            
-            update_key_in_lines(lines, "Tf_to_marker_left", [l_x, l_y, l_z, l_roll, l_pitch, l_yaw])
-            update_key_in_lines(lines, "Tf_to_marker_right", [r_x, r_y, r_z, r_roll, r_pitch, r_yaw])
+            self._update_camera_key_in_lines(lines, "Tf_to_marker_left", [l_x, l_y, l_z, l_roll, l_pitch, l_yaw])
+            self._update_camera_key_in_lines(lines, "Tf_to_marker_right", [r_x, r_y, r_z, r_roll, r_pitch, r_yaw])
             
             with open(config_path, "w") as f:
                 f.writelines(lines)
@@ -5003,6 +5179,10 @@ class UnifiedCalibrationApp(QWidget):
         self.btn_marker_start.setEnabled(enabled)
         if hasattr(self, 'btn_marker_result'):
             self.btn_marker_result.setEnabled(enabled)
+            
+        if hasattr(self, 'btn_step2_calculate') and self.btn_step2_calculate is not None:
+            is_calculating = hasattr(self, 'calc_worker') and self.calc_worker is not None and self.calc_worker.isRunning()
+            self.btn_step2_calculate.setEnabled(enabled and not is_calculating)
         
         self.btn_int_capture.setEnabled(enabled)
         self.btn_int_calibrate.setEnabled(enabled)
@@ -5056,6 +5236,8 @@ class UnifiedCalibrationApp(QWidget):
     def on_full_auto_ready_finished(self):
         self.set_controls_enabled(True)
         error_msg = getattr(self.active_worker, 'error_msg', None) if self.active_worker else None
+        if self.active_worker is not None:
+            self.active_worker.wait()
         self.active_worker = None
         
         # Restart poll_timer if appropriate
@@ -5118,69 +5300,76 @@ class UnifiedCalibrationApp(QWidget):
             result_path = self.get_latest_result_path()
             baseline_path = self.get_home_reset_path_for_result(result_path)
             
-            # Open Apply Home Offset Dialog
-            dialog = ApplyHomeOffsetDialog(
+            if hasattr(self, 'apply_offset_dialog') and self.apply_offset_dialog is not None and self.apply_offset_dialog.isVisible():
+                self.apply_offset_dialog.raise_()
+                self.apply_offset_dialog.activateWindow()
+                return
+
+            self.apply_offset_dialog = ApplyHomeOffsetDialog(
                 self,
                 result_path,
                 baseline_path,
-                self.arm_side,
+                "both",
                 include_head=True
             )
-            dialog.exec()
+            self.apply_offset_dialog.show()
+            self.apply_offset_dialog.raise_()
+            self.apply_offset_dialog.activateWindow()
         except Exception as e:
             QMessageBox.critical(self, "Apply Home Offset Error", str(e))
             self.log_msg(f"[ERROR] Apply home offset failed: {e}")
 
-    def home_offset_reset(self):
+    def home_offset_reset(self, confirm_dialog=True) -> bool:
         if not self.ui_only and not self.robot:
             QMessageBox.critical(self, "Error", "Robot is not connected.")
-            return
+            return False
 
-        msg = (
-            "Warning: Home Offset Reset will physically redefine the zero offset positions of your robot joints.\n\n"
-            "Steps:\n"
-            "1. Manually teach/move BOTH arms close to their home pose using direct teaching.\n"
-            "2. Ensure the head is also centered/aligned if you want to reset head offsets.\n"
-            "3. Click OK to start the process.\n\n"
-            "During this, the control manager will disable, 48v power will cycle, and the robot connection will automatically restart."
-        )
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Confirm Home Offset Reset")
-        dialog.setStyleSheet(DARK_STYLESHEET)
-        layout = QVBoxLayout(dialog)
+        if confirm_dialog:
+            msg = (
+                "Warning: Home Offset Reset will physically redefine the zero offset positions of your robot joints.\n\n"
+                "Steps:\n"
+                "1. Manually teach/move BOTH arms close to their home pose using direct teaching.\n"
+                "2. Ensure the head is also centered/aligned if you want to reset head offsets.\n"
+                "3. Click OK to start the process.\n\n"
+                "During this, the control manager will disable, 48v power will cycle, and the robot connection will automatically restart."
+            )
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Confirm Home Offset Reset")
+            dialog.setStyleSheet(DARK_STYLESHEET)
+            layout = QVBoxLayout(dialog)
 
-        # Image
-        img_label = QLabel()
-        pixmap = QPixmap("img/home_offset_position.png")
-        if not pixmap.isNull():
-            img_label.setPixmap(pixmap.scaled(600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        else:
-            img_label.setText("[img/home_offset_position.png not found]")
-        img_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(img_label)
+            # Image
+            img_label = QLabel()
+            pixmap = QPixmap("img/home_offset_position.png")
+            if not pixmap.isNull():
+                img_label.setPixmap(pixmap.scaled(600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                img_label.setText("[img/home_offset_position.png not found]")
+            img_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(img_label)
 
-        # Text
-        msg_label = QLabel(msg)
-        msg_label.setStyleSheet("font-size: 14px; color: white;")
-        layout.addWidget(msg_label)
+            # Text
+            msg_label = QLabel(msg)
+            msg_label.setStyleSheet("font-size: 14px; color: white;")
+            layout.addWidget(msg_label)
 
-        # Buttons
-        btn_layout = QHBoxLayout()
-        btn_ok = QPushButton("OK")
-        btn_ok.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; padding: 5px;")
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.setStyleSheet("background-color: #555; color: white; padding: 5px;")
-        
-        btn_ok.clicked.connect(dialog.accept)
-        btn_cancel.clicked.connect(dialog.reject)
-        
-        btn_layout.addStretch()
-        btn_layout.addWidget(btn_ok)
-        btn_layout.addWidget(btn_cancel)
-        layout.addLayout(btn_layout)
+            # Buttons
+            btn_layout = QHBoxLayout()
+            btn_ok = QPushButton("OK")
+            btn_ok.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; padding: 5px;")
+            btn_cancel = QPushButton("Cancel")
+            btn_cancel.setStyleSheet("background-color: #555; color: white; padding: 5px;")
+            
+            btn_ok.clicked.connect(dialog.accept)
+            btn_cancel.clicked.connect(dialog.reject)
+            
+            btn_layout.addStretch()
+            btn_layout.addWidget(btn_ok)
+            btn_layout.addWidget(btn_cancel)
+            layout.addLayout(btn_layout)
 
-        if dialog.exec() != QDialog.Accepted:
-            return
+            if dialog.exec() != QDialog.Accepted:
+                return False
 
         self.set_controls_enabled(False)
         self.btn_home_reset.setEnabled(False)
@@ -5195,12 +5384,17 @@ class UnifiedCalibrationApp(QWidget):
         self.active_worker.log_signal.connect(self.log_msg)
         self.active_worker.finished_signal.connect(self.on_home_offset_reset_finished)
         self.active_worker.start()
+        return True
 
     def on_home_offset_reset_finished(self, result):
         self.set_controls_enabled(True)
         self.btn_home_reset.setEnabled(True)
+        if self.active_worker is not None:
+            self.active_worker.wait()
         self.active_worker = None
         
+        success = False
+        error_msg = ""
         if result.get("success", False):
             self.log_msg("Re-connecting and initializing robot...")
             if self.robot:
@@ -5209,8 +5403,18 @@ class UnifiedCalibrationApp(QWidget):
             self.connect_robot() # Connects again
             self.log_msg("Home Offset Reset complete!")
             QMessageBox.information(self, "Success", "Home Offset Reset, Power, and Servo Initialization completed successfully!")
+            success = True
         else:
-            QMessageBox.warning(self, "Warning", f"Home Offset Reset finished, but some joints failed to reset: {result.get('error', '')}")
+            error_msg = result.get("error", "Some joints failed to reset")
+            QMessageBox.warning(self, "Warning", f"Home Offset Reset finished, but some joints failed to reset: {error_msg}")
+            success = False
+
+        if hasattr(self, 'wizard_widget') and self.wizard_widget is not None:
+            self.wizard_widget.set_wizard_busy(False)
+            if success:
+                self.wizard_widget.mark_step_completed(7, True, "Home Offset Reset complete")
+            else:
+                self.wizard_widget.mark_step_completed(7, False, error_msg)
 
     def clear_old_plots(self):
         self.generated_plots = []
@@ -5246,6 +5450,9 @@ class UnifiedCalibrationApp(QWidget):
             self.log_msg("[APPLY] Full auto results (Joints & Brackets) applied successfully.")
             QMessageBox.information(self, "Apply Complete", "All full auto calibration results have been applied successfully.")
             
+            if hasattr(self, 'wizard_widget') and self.wizard_widget is not None:
+                self.wizard_widget.on_step4_applied()
+            
 
     def start_full_auto(self):
         if not self.ui_only and not self.robot:
@@ -5256,6 +5463,23 @@ class UnifiedCalibrationApp(QWidget):
             
         self.log_text.clear()
         self.log_msg("[INFO] Starting Full Auto Sequential Calibration (Right -> Left Arm)...")
+        
+        # Reset all in-memory joint offsets to 0.0 so Full Auto starts clean
+        for arm in ["right", "left"]:
+            if hasattr(self, 'joint_offsets_store') and arm in self.joint_offsets_store:
+                for k in self.joint_offsets_store[arm]:
+                    self.joint_offsets_store[arm][k] = 0.0
+            if hasattr(self, 'joint_offsets') and arm in self.joint_offsets:
+                for k in self.joint_offsets[arm]:
+                    self.joint_offsets[arm][k] = 0.0
+
+        if hasattr(self, 'joint_calibrator') and self.joint_calibrator:
+            self.joint_calibrator.joint_offsets = self.joint_offsets
+        if hasattr(self, 'marker_calibrator') and self.marker_calibrator:
+            self.marker_calibrator.joint_offsets = self.joint_offsets
+
+        self.update_applied_offset_label()
+        self.log_msg("[FULL AUTO] Initial joint offsets reset to 0.0 before starting calibration.")
         if self.ui_only:
             self.log_msg("[MOCK GT] Simulated Ground-Truth Offsets:")
             is_v13 = self.get_robot_version() == "1.3"
@@ -5324,6 +5548,8 @@ class UnifiedCalibrationApp(QWidget):
             was_stopped = self.full_auto_stop_event.is_set()
             
         error_msg = getattr(self.active_worker, 'error_msg', None) if self.active_worker else None
+        if self.active_worker is not None:
+            self.active_worker.wait()
         self.active_worker = None
         self.log_msg("[INFO] Full Auto sequential calibration ended.")
         
@@ -5493,7 +5719,7 @@ class UnifiedCalibrationApp(QWidget):
             self.log_msg(f"[MOCK GT] Simulated Target Joint Offset: {gt_val:+.2f}°")
         
         curr_offset = self.joint_offsets[self.arm_side].get(offset_key, 0.0)
-        sweep_time = 20.0 if mode == "elbow" else 15.0
+        sweep_time = 20.0 if mode in ["elbow", "wrist_yaw2", "wrist_roll_v13"] else 15.0
         self.active_worker = JointCalibrationWorker(
             self.joint_calibrator, self.arm_side, mode, 
             ui_only=self.ui_only, 
@@ -6092,8 +6318,9 @@ class UnifiedCalibrationApp(QWidget):
             self.current_guide_idx = min(num_steps, len(self.captured_images))
 
     def run_intrinsics_calibration(self):
-        if len(self.captured_images) < 5:
-            self.log_msg("[ERROR] Need at least 5 frames to run calibration!")
+        if len(self.captured_images) < 16:
+            self.log_msg("[ERROR] Need all 16 valid frames to run calibration!")
+            QMessageBox.warning(self, "Insufficient Data", f"Cannot run calibration: Only {len(self.captured_images)} / 16 frames collected.\nPlease capture all 16 frames first.")
             return
             
         self.log_msg(f"\n[INTRINSICS] Running calibration on {len(self.captured_images)} images. Please wait...")
@@ -6127,11 +6354,19 @@ class UnifiedCalibrationApp(QWidget):
             self.show_intrinsics_verification()
         else:
             self.log_msg("[ERROR] Calibration failed. Check images and board settings.")
+            QMessageBox.critical(self, "Calibration Failed", "Calibration failed! Check board visibility and image quality.")
 
     def save_intrinsics_calibration(self):
-        if self.intrinsics_calibrator.cameraMatrix is None:
-            self.log_msg("[ERROR] No calibration data to save!")
+        if len(self.captured_images) < 16:
+            self.log_msg("[ERROR] Need all 16 frames to save parameters!")
+            QMessageBox.warning(self, "Cannot Save", f"Cannot save parameters: Only {len(self.captured_images)} / 16 frames collected.")
             return
+
+        if self.intrinsics_calibrator.cameraMatrix is None or float(self.intrinsics_calibrator.rms_error) <= 0.0:
+            self.log_msg("[ERROR] No valid calibration data to save!")
+            QMessageBox.warning(self, "Cannot Save", "Calibration has not been successfully executed yet.")
+            return
+
         try:
             data = {
                 "camera_matrix": self.intrinsics_calibrator.cameraMatrix.tolist(),

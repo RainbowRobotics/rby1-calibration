@@ -418,13 +418,13 @@ class QPCalibrationOptimizer:
                 r_j3 = jo.get("right", {}).get("joint3", 0.0)
                 l_j3 = jo.get("left", {}).get("joint3", 0.0)
 
-                v1_r3 = (-r_j3 - 0.001) * D2R
-                v2_r3 = (-r_j3 + 0.001) * D2R
+                v1_r3 = (-r_j3 - 0.1) * D2R
+                v2_r3 = (-r_j3 + 0.1) * D2R
                 q_lower[3] = min(v1_r3, v2_r3)
                 q_upper[3] = max(v1_r3, v2_r3)
 
-                v1_l3 = (-l_j3 - 0.001) * D2R
-                v2_l3 = (-l_j3 + 0.001) * D2R
+                v1_l3 = (-l_j3 - 0.1) * D2R
+                v2_l3 = (-l_j3 + 0.1) * D2R
                 q_lower[10] = min(v1_l3, v2_l3)
                 q_upper[10] = max(v1_l3, v2_l3)
                 # In 1.2, Joint 5 is calibrated
@@ -445,14 +445,14 @@ class QPCalibrationOptimizer:
                 r_j6 = jo.get("right", {}).get("joint6", 0.0)
                 l_j6 = jo.get("left", {}).get("joint6", 0.0)
 
-                v1_r6 = (-r_j6 - 0.001) * D2R
-                v2_r6 = (-r_j6 + 0.001) * D2R
+                v1_r6 = (-r_j6 - 0.1) * D2R
+                v2_r6 = (-r_j6 + 0.1) * D2R
 
                 q_lower[6] = min(v1_r6, v2_r6)
                 q_upper[6] = max(v1_r6, v2_r6)
 
-                v1_l6 = (-l_j6 - 0.001) * D2R
-                v2_l6 = (-l_j6 + 0.001) * D2R
+                v1_l6 = (-l_j6 - 0.1) * D2R
+                v2_l6 = (-l_j6 + 0.1) * D2R
 
                 q_lower[13] = min(v1_l6, v2_l6)
                 q_upper[13] = max(v1_l6, v2_l6)

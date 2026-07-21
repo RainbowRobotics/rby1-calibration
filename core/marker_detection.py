@@ -174,21 +174,22 @@ class RealSenseCamera:
             for i in range(10):
                 self.pipeline.wait_for_frames()
             
-            # [NEW] 센서 수동 노출(Manual Exposure) 설정 - 모션 블러 방지 및 Gain 활용
+            # [NEW] 센서 자동 노출(Auto Exposure) 설정 - 다양한 환경 대응
             device = self.profile.get_device()
             for sensor in device.query_sensors():
                 if sensor.supports(rs.option.enable_auto_exposure):
-                    sensor.set_option(rs.option.enable_auto_exposure, 0)
-                if sensor.supports(rs.option.exposure):
-                    try:
-                        sensor.set_option(rs.option.exposure, 8000) # 8ms (모션 블러 방지와 밝기 밸런스)
-                    except Exception as e:
-                        print(f"Warning: Failed to set exposure on sensor {sensor.get_info(rs.camera_info.name)}: {e}")
-                if sensor.supports(rs.option.gain):
-                    try:
-                        sensor.set_option(rs.option.gain, 80) # Gain 상향으로 밝기 확보
-                    except Exception as e:
-                        print(f"Warning: Failed to set gain on sensor {sensor.get_info(rs.camera_info.name)}: {e}")
+                    sensor.set_option(rs.option.enable_auto_exposure, 1) # 자동 노출 활성화 (기존 수동 0)
+                # 기존 수동 설정 주석 처리
+                # if sensor.supports(rs.option.exposure):
+                #     try:
+                #         sensor.set_option(rs.option.exposure, 6000) # 6ms (모션 블러 방지와 밝기 밸런스)
+                #     except Exception as e:
+                #         print(f"Warning: Failed to set exposure on sensor {sensor.get_info(rs.camera_info.name)}: {e}")
+                # if sensor.supports(rs.option.gain):
+                #     try:
+                #         sensor.set_option(rs.option.gain, 80) # Gain 상향으로 밝기 확보
+                #     except Exception as e:
+                #         print(f"Warning: Failed to set gain on sensor {sensor.get_info(rs.camera_info.name)}: {e}")
 
             # depth 카메라 내부 파라미터 얻기 : baseline, fx, fy, principal_point 를 위해 사용
             color_stream = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
