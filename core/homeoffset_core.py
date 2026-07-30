@@ -349,7 +349,39 @@ def validate_home_offset_joint_limits(robot, model, arm="both", include_head=Tru
         dyn_model = model.get_dynamics_model()
         q_lower = np.array(dyn_model.get_limit_q_lower(state), dtype=np.float64).reshape(-1)
         q_upper = np.array(dyn_model.get_limit_q_upper(state), dtype=np.float64).reshape(-1)
-        
+
+        # 1. Posture Direction Sign Validation for Home Offset Reset
+        # Right Arm: J1 (Shoulder Roll) <= 0, J3 (Elbow) <= 0
+        # Left Arm:  J1 (Shoulder Roll) >= 0, J3 (Elbow) <= 0
+        tol = np.radians(5.0)  # 5° buffer
+        invalid_reasons = []
+
+        if arm in ("right", "both"):
+            r_j1 = q_current[model.right_arm_idx[1]]
+            r_j3 = q_current[model.right_arm_idx[3]]
+            if r_j1 > tol:
+                invalid_reasons.append(f"오른쪽 Shoulder Roll(J1)이 양수(+{np.degrees(r_j1):.1f}°)입니다. 음수(-) 방향(몸 안쪽)이어야 합니다.")
+            if r_j3 > tol:
+                invalid_reasons.append(f"오른쪽 Elbow(J3)가 양수(+{np.degrees(r_j3):.1f}°)입니다. 음수(-) 방향(뒤쪽)이어야 합니다.")
+
+        if arm in ("left", "both"):
+            l_j1 = q_current[model.left_arm_idx[1]]
+            l_j3 = q_current[model.left_arm_idx[3]]
+            if l_j1 < -tol:
+                invalid_reasons.append(f"왼쪽 Shoulder Roll(J1)이 음수({np.degrees(l_j1):.1f}°)입니다. 양수(+) 방향(몸 안쪽)이어야 합니다.")
+            if l_j3 > tol:
+                invalid_reasons.append(f"왼쪽 Elbow(J3)가 양수(+{np.degrees(l_j3):.1f}°)입니다. 음수(-) 방향(뒤쪽)이어야 합니다.")
+
+        if invalid_reasons:
+            err_msg = (
+                "⚠️ 유효하지 않은 홈 오프셋 리셋 자세입니다!\n\n"
+                + "\n".join(f"- {reason}" for reason in invalid_reasons)
+                + "\n\n안내 가이드라인(이미지 및 지침 사항)을 참고하여 각 관절을 올바른 방향으로 위치시킨 후 다시 리셋을 시도해 주세요."
+            )
+            if log_cb:
+                log_cb(f"[ERROR] {err_msg}")
+            return False, err_msg
+
         # Load ready_poses.yaml if available
         import yaml
         config_dir = Path(__file__).resolve().parent.parent / "config"

@@ -104,133 +104,141 @@ class MarkerCalibrator(BaseCalibrator):
         return True
 
     def perform_calibration_sweep(self, arm_side, axis_mode, log_callback=None, status_callback=None, use_head_tracking=True, save_debug=False):
-        if getattr(self, 'stop_requested', False):
-            return None
-
-        if log_callback:
-            log_callback("\n" + "="*50)
-            log_callback(f"   STARTING {str(axis_mode).upper()} CONTINUOUS MARKER SWEEP")
-            log_callback("="*50)
-            
-        is_camera_mock = (self.marker_st is None or type(self.marker_st).__name__ == "SimulatedMarkerTransform")
-
-        if not is_camera_mock:
-            # Pre-check marker visibility
-            initial_check = self.marker_st.get_marker_transform(sampling_time=2.0, side=arm_side)
-            if not initial_check:
-                if log_callback: log_callback("[ERROR] Marker is not visible in ready pose.")
-                if status_callback: status_callback(False)
+        try:
+            if getattr(self, 'stop_requested', False):
                 return None
-            if status_callback: status_callback(True)
-        else:
-            if status_callback: status_callback(True)
 
-        if getattr(self, 'stop_requested', False):
-            return None
-
-        state = self.robot.get_state()
-        model = self.robot.model()
-        arm_idx = model.left_arm_idx if arm_side == "left" else model.right_arm_idx
-        initial_joint_pos = list(state.position[arm_idx])
-
-        # Sweep configuration from MARKER_CONFIGS
-        axis_str = str(axis_mode).lower()
-        mcfg = None
-        for key in self.MARKER_CONFIGS:
-            if key in axis_str or key.split("_")[-1] in axis_str:
-                mcfg = self.MARKER_CONFIGS[key]
-                break
-        if mcfg is None:
-            raise ValueError(f"Unknown marker sweep axis mode: {axis_mode}")
-        
-        start_deg = mcfg["start_deg"]
-        end_deg = mcfg["end_deg"]
-        joint_i = mcfg["joint_i"]
-
-        # Head index and active head tracking setup
-        head_idx = model.head_idx[:2] if len(model.head_idx) >= 2 else None
-        q_head_0 = state.position[head_idx].copy() if head_idx is not None else None
-        dyn_model = self.robot.get_dynamics()
-        
-        q_head_start = None
-        if use_head_tracking and head_idx is not None and q_head_0 is not None:
-            q_head_start = q_head_0
-
-        dataset = self.perform_single_joint_sweep(
-            arm_side, joint_i, initial_joint_pos, start_deg, end_deg, 15.0,
-            q_head=q_head_start, label=f"Marker Axis {axis_mode}", log_callback=log_callback
-        )
-        if dataset is None:
-            return None
-
-        captured_poses = [pose for _, pose in dataset]
-        captured_angles = [np.degrees(q_full[arm_idx[joint_i]] - initial_joint_pos[joint_i]) for q_full, _ in dataset]
-        captured_q_full = [q_full for q_full, _ in dataset]
-
-        # Return arm and head to original ready pose
-        if log_callback: log_callback("\n[INFO] Sweep complete. Returning to initial ready pose...")
-        if arm_side == "left":
-            ok = self.movej(self.robot, left_arm=initial_joint_pos, head=q_head_0, minimum_time=2.5, apply_offsets=False)
-        else:
-            ok = self.movej(self.robot, right_arm=initial_joint_pos, head=q_head_0, minimum_time=2.5, apply_offsets=False)
-
-        if not ok or getattr(self, 'stop_requested', False):
-            if log_callback: log_callback("[ERROR] Failed to return to initial ready pose or stop was requested.")
-            return None
-
-        if len(captured_poses) < 10:
-            if log_callback: log_callback("[ERROR] Too few valid marker poses. Calibration failed.")
-            return None
-
-        # Solve Circle Fitting
-        n_nom = mcfg["n_nom_v13"] if self.is_v13() else mcfg["n_nom_v12"]
-        res = self.fit_circle_3d_and_6dof_misalignment(captured_poses, captured_angles, axis_prior=n_nom, robust=not self.is_mock)
-        
-        # Load mount_to_cam (transform from head mount "link_head_2" to camera)
-        mount_to_cam = self.camera_config.get("mount_to_cam", [0.047, 0.009, 0.057, -90.0, 0.0, -90.0])
-        # Force camera translation components to zero as requested and use fixed rotation
-        mount_to_cam_rot_only = [0.0, 0.0, 0.0] + list(mount_to_cam[3:])
-        T_t5_to_cam_fixed = self.make_transform(mount_to_cam_rot_only)
-        
-        ee_name = f"ee_{arm_side}"
-        pts_ee = []
-        is_v13 = self.is_v13()
-        for q_full, pose_cam_to_marker in zip(captured_q_full, captured_poses):
-            try:
-                # q_physical = q_full - joint_offset (apply joint offsets to reconstruct actual physical angle)
-                q_mod = np.array(q_full)
-                if hasattr(self, 'joint_offsets') and self.joint_offsets:
-                    offsets = self.joint_offsets[arm_side] if arm_side in self.joint_offsets else self.joint_offsets
-                    q_mod[arm_idx[3]] -= np.radians(offsets.get("elbow", 0.0))
-                    q_mod[arm_idx[5]] -= np.radians(offsets.get("wrist_pitch", 0.0))
-                    if is_v13:
-                        q_mod[arm_idx[6]] -= np.radians(offsets.get("wrist_roll", 0.0))
-                    else:
-                        q_mod[arm_idx[6]] -= np.radians(offsets.get("wrist_yaw2", 0.0))
+            if log_callback:
+                log_callback("\n" + "="*50)
+                log_callback(f"   STARTING {str(axis_mode).upper()} CONTINUOUS MARKER SWEEP")
+                log_callback("="*50)
                 
-                T_t5_to_head = self.compute_fk(self.robot, dyn_model, q_mod, "link_head_2", "link_torso_5")
-                T_t5_to_cam = T_t5_to_head @ T_t5_to_cam_fixed
-                
-                T_t5_to_marker = T_t5_to_cam @ pose_cam_to_marker
-                T_t5_to_ee = self.compute_fk(self.robot, dyn_model, q_mod, ee_name, "link_torso_5")
-                p_ee = np.linalg.inv(T_t5_to_ee) @ T_t5_to_marker @ np.array([0, 0, 0, 1])
-                pts_ee.append(p_ee[:3] * 1000.0) # in mm
-            except Exception as e:
-                pass
-        
-        if len(pts_ee) > 0:
-            res['pts_ee'] = np.array(pts_ee)
-        else:
-            res['pts_ee'] = np.zeros((0, 3))
+            is_camera_mock = (self.marker_st is None or type(self.marker_st).__name__ == "SimulatedMarkerTransform")
+
+            if not is_camera_mock:
+                # Pre-check marker visibility
+                initial_check = self.marker_st.get_marker_transform(sampling_time=2.0, side=arm_side)
+                if not initial_check:
+                    if log_callback: log_callback("[ERROR] Marker is not visible in ready pose.")
+                    if hasattr(self, 'marker_problem_callback') and self.marker_problem_callback:
+                        if log_callback: log_callback("[INFO] Prompting user for manual teaching due to marker visibility error...")
+                        resolved = self.marker_problem_callback(arm_side)
+                        if resolved:
+                            self.perform_move_to_ready_pose(arm_side, mode="marker", log_callback=log_callback)
+                            initial_check = self.marker_st.get_marker_transform(sampling_time=2.0, side=arm_side)
+                    if not initial_check:
+                        if status_callback: status_callback(False)
+                        return None
+                if status_callback: status_callback(True)
+            else:
+                if status_callback: status_callback(True)
+
+            if getattr(self, 'stop_requested', False):
+                return None
+
+            state = self.robot.get_state()
+            model = self.robot.model()
+            arm_idx = model.left_arm_idx if arm_side == "left" else model.right_arm_idx
+            initial_joint_pos = list(state.position[arm_idx])
+
+            # Sweep configuration from MARKER_CONFIGS
+            axis_str = str(axis_mode).lower()
+            mcfg = None
+            for key in self.MARKER_CONFIGS:
+                if key in axis_str or key.split("_")[-1] in axis_str:
+                    mcfg = self.MARKER_CONFIGS[key]
+                    break
+            if mcfg is None:
+                raise ValueError(f"Unknown marker sweep axis mode: {axis_mode}")
             
-        res['captured_poses'] = captured_poses
-        res['captured_q_full'] = captured_q_full
-        if save_debug:
-            dataset = list(zip(captured_q_full, captured_poses))
-            self.save_debug_points(
-                arm_side, axis_mode, dataset, initial_joint_pos, ee_name, dyn_model, T_t5_to_cam_fixed, "marker", log_callback
+            start_deg = mcfg["start_deg"]
+            end_deg = mcfg["end_deg"]
+            joint_i = mcfg["joint_i"]
+
+            # Head index and active head tracking setup
+            head_idx = model.head_idx[:2] if len(model.head_idx) >= 2 else None
+            q_head_0 = state.position[head_idx].copy() if head_idx is not None else None
+            dyn_model = self.robot.get_dynamics()
+            
+            q_head_start = None
+            if use_head_tracking and head_idx is not None and q_head_0 is not None:
+                q_head_start = q_head_0
+
+            dataset = self.perform_single_joint_sweep(
+                arm_side, joint_i, initial_joint_pos, start_deg, end_deg, 10.0,
+                q_head=q_head_start, label=f"Marker Axis {axis_mode}", log_callback=log_callback, mode="marker"
             )
-        return res
+            if dataset is None:
+                return None
+
+            if dataset:
+                initial_joint_pos = list(dataset[0][0][arm_idx])
+
+            captured_poses = [pose for _, pose in dataset]
+            captured_angles = [np.degrees(q_full[arm_idx[joint_i]] - initial_joint_pos[joint_i]) for q_full, _ in dataset]
+            captured_q_full = [q_full for q_full, _ in dataset]
+
+            if getattr(self, 'stop_requested', False):
+                if log_callback: log_callback("[INFO] Stop requested during marker sweep.")
+                return None
+
+            if len(captured_poses) < 20:
+                if log_callback: log_callback("[ERROR] Too few valid marker poses (<10). Prompting posture adjustment...")
+                if hasattr(self, 'marker_problem_callback') and self.marker_problem_callback:
+                    self.marker_problem_callback(arm_side)
+                return None
+
+            # Solve Circle Fitting
+            n_nom = mcfg["n_nom_v13"] if self.is_v13() else mcfg["n_nom_v12"]
+            res = self.fit_circle_3d_and_6dof_misalignment(captured_poses, captured_angles, axis_prior=n_nom, robust=not self.is_mock)
+            
+            # Load mount_to_cam (transform from head mount "link_head_2" to camera)
+            mount_to_cam = self.camera_config.get("mount_to_cam", [0.047, 0.009, 0.057, -90.0, 0.0, -90.0])
+            # Force camera translation components to zero as requested and use fixed rotation
+            mount_to_cam_rot_only = [0.0, 0.0, 0.0] + list(mount_to_cam[3:])
+            T_t5_to_cam_fixed = self.make_transform(mount_to_cam_rot_only)
+            
+            ee_name = f"ee_{arm_side}"
+            pts_ee = []
+            is_v13 = self.is_v13()
+            for q_full, pose_cam_to_marker in zip(captured_q_full, captured_poses):
+                try:
+                    # q_physical = q_full - joint_offset (apply joint offsets to reconstruct actual physical angle)
+                    q_mod = np.array(q_full)
+                    if hasattr(self, 'joint_offsets') and self.joint_offsets:
+                        offsets = self.joint_offsets[arm_side] if arm_side in self.joint_offsets else self.joint_offsets
+                        q_mod[arm_idx[3]] -= np.radians(offsets.get("elbow", 0.0))
+                        q_mod[arm_idx[5]] -= np.radians(offsets.get("wrist_pitch", 0.0))
+                        if is_v13:
+                            q_mod[arm_idx[6]] -= np.radians(offsets.get("wrist_roll", 0.0))
+                        else:
+                            q_mod[arm_idx[6]] -= np.radians(offsets.get("wrist_yaw2", 0.0))
+                    
+                    T_t5_to_head = self.compute_fk(self.robot, dyn_model, q_mod, "link_head_2", "link_torso_5")
+                    T_t5_to_cam = T_t5_to_head @ T_t5_to_cam_fixed
+                    
+                    T_t5_to_marker = T_t5_to_cam @ pose_cam_to_marker
+                    T_t5_to_ee = self.compute_fk(self.robot, dyn_model, q_mod, ee_name, "link_torso_5")
+                    p_ee = np.linalg.inv(T_t5_to_ee) @ T_t5_to_marker @ np.array([0, 0, 0, 1])
+                    pts_ee.append(p_ee[:3] * 1000.0) # in mm
+                except Exception as e:
+                    pass
+            
+            if len(pts_ee) > 0:
+                res['pts_ee'] = np.array(pts_ee)
+            else:
+                res['pts_ee'] = np.zeros((0, 3))
+                
+            res['captured_poses'] = captured_poses
+            res['captured_q_full'] = captured_q_full
+            if save_debug:
+                dataset = list(zip(captured_q_full, captured_poses))
+                self.save_debug_points(
+                    arm_side, axis_mode, dataset, initial_joint_pos, ee_name, dyn_model, T_t5_to_cam_fixed, "marker", log_callback
+                )
+            return res
+        finally:
+            pass
 
     def get_link_length(self, arm_side):
         try:

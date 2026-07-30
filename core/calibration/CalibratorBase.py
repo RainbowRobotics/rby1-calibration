@@ -17,16 +17,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 class BaseCalibrator:
     JOINT_CONFIGS = {
-        "wrist_roll_v13":  {"cand_joint": 6, "sweep_joint_A": 6, "sweep_joint_B": 5, "offset_key": "wrist_roll",  "offset_range": (-30.0, 30.0), "sweep_range_A": 25.0, "sweep_range_B": 20.0},
-        "wrist_pitch_v13": {"cand_joint": 5, "sweep_joint_A": 5, "sweep_joint_B": 3, "offset_key": "wrist_pitch", "offset_range": (-30.0, 30.0), "sweep_range_A": 20.0, "sweep_range_B": 15.0},
-        "wrist_yaw2":      {"cand_joint": 6, "sweep_joint_A": 6, "sweep_joint_B": 5, "offset_key": "wrist_yaw2",  "offset_range": (-30.0, 30.0), "sweep_range_A": 25.0, "sweep_range_B": 20.0},
-        "wrist_pitch":     {"cand_joint": 5, "sweep_joint_A": 4, "sweep_joint_B": 6, "offset_key": "wrist_pitch", "offset_range": (-30.0, 30.0), "sweep_range_A": 20.0, "sweep_range_B": 20.0},
-        "elbow":           {"cand_joint": 3, "sweep_joint_A": 2, "sweep_joint_B": 4, "offset_key": "elbow",       "offset_range": (-5.0, 0.0),   "sweep_range_A": 20.0, "sweep_range_B": 20.0},
+        "wrist_roll_v13":  {"cand_joint": 6, "sweep_joint_A": 6, "sweep_joint_B": 5, "offset_key": "wrist_roll",  "offset_range": (-30.0, 30.0), "sweep_range_A": 20.0, "sweep_range_B": 15.0},
+        "wrist_pitch_v13": {"cand_joint": 5, "sweep_joint_A": 5, "sweep_joint_B": 3, "offset_key": "wrist_pitch", "offset_range": (-30.0, 30.0), "sweep_range_A": 15.0, "sweep_range_B": 15.0},
+        "wrist_yaw2":      {"cand_joint": 6, "sweep_joint_A": 6, "sweep_joint_B": 5, "offset_key": "wrist_yaw2",  "offset_range": (-30.0, 30.0), "sweep_range_A": 20.0, "sweep_range_B": 15.0},
+        "wrist_pitch":     {"cand_joint": 5, "sweep_joint_A": 4, "sweep_joint_B": 6, "offset_key": "wrist_pitch", "offset_range": (-30.0, 30.0), "sweep_range_A": 15.0, "sweep_range_B": 15.0},
+        "elbow":           {"cand_joint": 3, "sweep_joint_A": 2, "sweep_joint_B": 4, "offset_key": "elbow",       "offset_range": (-5.0, 0.0),   "sweep_range_A": 15.0, "sweep_range_B": 15.0},
     }
     MARKER_CONFIGS = {
         "axis_4": {"joint_i": 4, "start_deg": -15.0, "end_deg": 15.0, "n_nom_v12": [0.0, 0.0, 1.0], "n_nom_v13": [0.0, 0.0, 1.0]},
-        "axis_5": {"joint_i": 5, "start_deg": -25.0, "end_deg": 25.0, "n_nom_v12": [0.0, 1.0, 0.0], "n_nom_v13": [0.0, 1.0, 0.0]},
-        "axis_6": {"joint_i": 6, "start_deg": -25.0, "end_deg": 25.0, "n_nom_v12": [0.0, 0.0, 1.0], "n_nom_v13": [1.0, 0.0, 0.0]},
+        "axis_5": {"joint_i": 5, "start_deg": -15.0, "end_deg": 15.0, "n_nom_v12": [0.0, 1.0, 0.0], "n_nom_v13": [0.0, 1.0, 0.0]},
+        "axis_6": {"joint_i": 6, "start_deg": -15.0, "end_deg": 15.0, "n_nom_v12": [0.0, 0.0, 1.0], "n_nom_v13": [1.0, 0.0, 0.0]},
     }
     MOCK_GT_OFFSETS = {
         "right": {
@@ -82,7 +82,20 @@ class BaseCalibrator:
         
         # Active joint home offsets to apply to commanded trajectories
         self.joint_offsets = {"wrist_pitch": 0.0, "elbow": 0.0}
+        self.user_taught_ready_poses = {}
         self.stop_requested = False
+
+    def clear_user_taught_ready_poses(self, arm_side=None, mode=None):
+        if hasattr(self, 'user_taught_ready_poses') and isinstance(self.user_taught_ready_poses, dict):
+            if arm_side and mode:
+                norm_mode = "wrist_pitch" if mode == "wrist_pitch_v13" else ("wrist_roll" if mode == "wrist_roll_v13" else mode)
+                if arm_side in self.user_taught_ready_poses and isinstance(self.user_taught_ready_poses[arm_side], dict):
+                    self.user_taught_ready_poses[arm_side].pop(norm_mode, None)
+            elif arm_side:
+                if arm_side in self.user_taught_ready_poses and isinstance(self.user_taught_ready_poses[arm_side], dict):
+                    self.user_taught_ready_poses[arm_side].clear()
+            else:
+                self.user_taught_ready_poses.clear()
 
     def load_ready_poses(self):
         config_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config"))
@@ -111,6 +124,18 @@ class BaseCalibrator:
         """Returns True only for model-m v1.3 robots."""
         return self.get_robot_version() == "1.3"
 
+    def is_head_active(self) -> bool:
+        if getattr(self, 'include_head_motion', None) is False:
+            return False
+        if getattr(self, 'head_enabled', None) is False:
+            return False
+        if hasattr(self, 'app') and getattr(self.app, 'include_head_motion', None) is False:
+            return False
+        if hasattr(self, 'app') and hasattr(self.app, 'chk_servo_head') and not self.app.chk_servo_head.isChecked():
+            return False
+        model = getattr(self.robot, 'model', lambda: None)() if hasattr(self, 'robot') and self.robot else None
+        return model is not None and hasattr(model, 'head_idx') and len(getattr(model, 'head_idx', [])) >= 2
+
     def get_ready_pose(self, version_key, type_key, mode_key, arm_side):
         if not self.ready_poses:
             raise RuntimeError("Ready poses are not loaded or the configuration file is empty.")
@@ -126,7 +151,16 @@ class BaseCalibrator:
                 val = val["check_calib"][f"{arm_side}_arm"]
             else:
                 val = val["marker"][f"{arm_side}_arm"]
-            return np.deg2rad(val)
+            val_arr = np.array(val, dtype=np.float64).copy()
+            # If Head is disabled or robot has no 2-DOF head (fixed chest camera), lower Shoulder Pitch (Joint 0) by 15 deg
+            # to ensure markers stay within the fixed camera FOV instead of rising above it.
+            if not self.is_head_active() and len(val_arr) >= 7:
+                val_arr[0] += 20.0  # Joint 0 positive pitch lowers the arm down into fixed FOV (-55 -> -35 deg)
+                msg = f"[READY POSE] Head disabled (Fixed Chest Camera): Joint 0 pitch lowered by +20° ({val_arr[0]:.1f}°) for {arm_side}_arm ({type_key})"
+                print(msg)
+                logging.info(msg)
+
+            return np.deg2rad(val_arr)
         except (KeyError, TypeError) as e:
             raise KeyError(
                 f"[ERROR] Failed to get ready pose for version='{version_key}', type='{type_key}', mode='{mode_key}', arm='{arm_side}_arm'. "
@@ -974,6 +1008,7 @@ class BaseCalibrator:
             if log_callback: log_callback("[ERROR] Robot not connected.")
             return False
 
+        self.current_calib_mode = mode
         if log_callback: log_callback(f"[INFO] Moving {arm_side} arm to {mode} Ready Pose...")
         torso = [0, 0, 0, 0, 0, 0]
         
@@ -1007,12 +1042,29 @@ class BaseCalibrator:
             else:
                 ready_mode = "wrist_pitch"
             
-        if arm_side == "right":
-            right_arm = self.get_ready_pose(version_key, type_key, ready_mode, "right")
-            left_arm = None
+        norm_mode = "wrist_pitch" if mode == "wrist_pitch_v13" else ("wrist_roll" if mode == "wrist_roll_v13" else mode)
+        taught_pose = None
+        if hasattr(self, 'user_taught_ready_poses') and isinstance(self.user_taught_ready_poses, dict):
+            arm_dict = self.user_taught_ready_poses.get(arm_side)
+            if isinstance(arm_dict, dict):
+                taught_pose = arm_dict.get(norm_mode)
+
+        if taught_pose is not None:
+            if log_callback:
+                log_callback(f"[INFO] Preserved user-taught ready pose detected for {arm_side} arm ({norm_mode}). Using taught posture.")
+            if arm_side == "right":
+                right_arm = taught_pose
+                left_arm = None
+            else:
+                right_arm = None
+                left_arm = taught_pose
         else:
-            right_arm = None
-            left_arm = self.get_ready_pose(version_key, type_key, ready_mode, "left")
+            if arm_side == "right":
+                right_arm = self.get_ready_pose(version_key, type_key, ready_mode, "right")
+                left_arm = None
+            else:
+                right_arm = None
+                left_arm = self.get_ready_pose(version_key, type_key, ready_mode, "left")
 
         success = self.movej(self.robot, torso=torso, right_arm=right_arm, left_arm=left_arm, head=None, minimum_time=5.0)
         if success and log_callback:
@@ -1241,16 +1293,16 @@ class BaseCalibrator:
         # 1. Move to start position
         logging.info(f"[INFO] Moving {label} to start sweep position...")
         if arm_side == "left":
-            ok = self.movej(self.robot, left_arm=q_start, head=q_head, minimum_time=2.5, apply_offsets=False)
+            ok = self.movej(self.robot, left_arm=q_start, head=q_head, minimum_time=1.2, apply_offsets=False)
         else:
-            ok = self.movej(self.robot, right_arm=q_start, head=q_head, minimum_time=2.5, apply_offsets=False)
+            ok = self.movej(self.robot, right_arm=q_start, head=q_head, minimum_time=1.2, apply_offsets=False)
 
         if not ok or getattr(self, 'stop_requested', False):
             if log_callback: log_callback(f"[ERROR] Failed to move {label} to start pose or stop requested.")
             return None
 
         if self.robot:
-            time.sleep(1.0)
+            time.sleep(0.5)
         else:
             time.sleep(0.01)
 
@@ -1278,7 +1330,22 @@ class BaseCalibrator:
                 return None
 
             if self.robot:
-                q_full_captured = np.array(self.robot.get_state().position)
+                q_full_captured = None
+                for retry in range(3):
+                    try:
+                        state_obj = self.robot.get_state()
+                        if state_obj is not None and getattr(state_obj, 'position', None) is not None:
+                            q_full_captured = np.array(state_obj.position)
+                            break
+                    except Exception as e:
+                        if retry == 2:
+                            self.logger.warning(f"get_state() failed after 3 retries: {e}")
+                        time.sleep(0.005)
+                if q_full_captured is None:
+                    if len(dataset) > 0:
+                        q_full_captured = dataset[-1][0].copy()
+                    else:
+                        q_full_captured = np.zeros(20)
             else:
                 q_full_captured = np.zeros(20)
 
@@ -1309,7 +1376,7 @@ class BaseCalibrator:
                         dataset.append((q_full_captured, pose_mat))
 
             if is_camera_mock:
-                time.sleep(0.002)
+                time.sleep(0.033)
             else:
                 time.sleep(0.01)
 
@@ -1319,7 +1386,25 @@ class BaseCalibrator:
             return None
 
         if len(dataset) < 10:
-            if log_callback: log_callback(f"[ERROR] Too few valid captured points for {label}. Calibration failed.")
+            if log_callback: log_callback(f"[ERROR] Too few valid captured points for {label} ({len(dataset)} points). Returning to ready pose and prompting posture adjustment...")
+            try:
+                sweep_mode = kwargs.get('mode', "marker" if "Marker" in label else "joint")
+                self.perform_move_to_ready_pose(arm_side, mode=sweep_mode, log_callback=log_callback)
+            except Exception as e:
+                if log_callback: log_callback(f"[WARN] Failed to return to ready pose: {e}")
+            if hasattr(self, 'marker_problem_callback') and self.marker_problem_callback:
+                resolved = self.marker_problem_callback(arm_side)
+                if resolved:
+                    sweep_mode = kwargs.get('mode', "marker" if "Marker" in label else "joint")
+                    norm_mode = "wrist_pitch" if sweep_mode == "wrist_pitch_v13" else ("wrist_roll" if sweep_mode == "wrist_roll_v13" else sweep_mode)
+                    if hasattr(self, 'user_taught_ready_poses') and isinstance(self.user_taught_ready_poses, dict):
+                        arm_dict = self.user_taught_ready_poses.get(arm_side)
+                        if isinstance(arm_dict, dict) and arm_dict.get(norm_mode) is not None:
+                            q_center = arm_dict.get(norm_mode)
+                    return self.perform_single_joint_sweep(
+                        arm_side, sweep_joint, q_center, start_deg, end_deg, sweep_duration,
+                        q_head=q_head, label=label, log_callback=log_callback, **kwargs
+                    )
             return None
 
         logging.info(f"    -> Swept {len(dataset)} dense raw coordinate frames during {label} motion.")

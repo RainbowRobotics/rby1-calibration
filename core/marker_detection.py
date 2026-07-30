@@ -302,16 +302,19 @@ class RealSenseCamera:
         try:
             frames = self.pipeline.wait_for_frames()
             
-            # 카메라의 depth map을 사용할 경우 컬러 이미지와 해상도, 사이즈를 맞추기 위해 align을 사용.
-            align_to = rs.stream.color
-            align = rs.align(align_to)
-            aligned_frames = align.process(frames)
-            color_frame = aligned_frames.get_color_frame()
-            depth_frame = aligned_frames.get_depth_frame()
-            # 추가 필터적용
-            depth_frame = self.spatial.process(depth_frame)
-            depth_frame = self.temporal.process(depth_frame)
-            depth_frame = self.hole_filling.process(depth_frame)
+            # [LEGACY] RealSense CPU Depth Align & Filter (마커 PnP 검출에는 미사용되나 프레임당 25ms 병목 발생 -> 주석 처리)
+            # align_to = rs.stream.color
+            # align = rs.align(align_to)
+            # aligned_frames = align.process(frames)
+            # color_frame = aligned_frames.get_color_frame()
+            # depth_frame = aligned_frames.get_depth_frame()
+            # depth_frame = self.spatial.process(depth_frame)
+            # depth_frame = self.temporal.process(depth_frame)
+            # depth_frame = self.hole_filling.process(depth_frame)
+
+            # [OPTIMIZED] Color 및 Depth 프레임 직접 취득 (CPU 병목 제거)
+            color_frame = frames.get_color_frame()
+            depth_frame = frames.get_depth_frame()
             if not color_frame or not depth_frame:
                 print("no frame")
                 return
@@ -479,17 +482,21 @@ class Marker_Detection:
 
     # 마커들의 중심좌표(4*4행렬)
     def detect(self, color_image, lpf = False, logging = False, depth_image = None, use_filter = True):
+        # [LEGACY] 이미지 전체 렌즈 왜곡 펴기 (CPU 처리 병목 발생 원인 -> 롤백 가능하도록 주석 처리)
+        # pnp_dist_coeffs = self.dist_coeffs
+        # if self.dist_coeffs is not None and np.any(self.dist_coeffs != 0):
+        #     base_cam_mat = np.array([
+        #         [self.fx, 0, self.principal_point[0]],
+        #         [0, self.fy, self.principal_point[1]],
+        #         [0, 0, 1]
+        #     ], dtype=np.float32)
+        #     # 이미지 전체 렌즈 왜곡 펴기 (마커 모서리 직선 복원)
+        #     color_image = cv2.undistort(color_image, base_cam_mat, self.dist_coeffs, None, base_cam_mat)
+        #     # 이미 왜곡을 폈으므로, 이후 solvePnP에서는 왜곡 파라미터 무시 (이중 보정 방지)
+        #     pnp_dist_coeffs = None
+
+        # [OPTIMIZED] 이미지 전체 undistort 대신, solvePnP에 distort 파라미터를 넘겨 0.01ms 내 보정
         pnp_dist_coeffs = self.dist_coeffs
-        if self.dist_coeffs is not None and np.any(self.dist_coeffs != 0):
-            base_cam_mat = np.array([
-                [self.fx, 0, self.principal_point[0]],
-                [0, self.fy, self.principal_point[1]],
-                [0, 0, 1]
-            ], dtype=np.float32)
-            # 이미지 전체 렌즈 왜곡 펴기 (마커 모서리 직선 복원)
-            color_image = cv2.undistort(color_image, base_cam_mat, self.dist_coeffs, None, base_cam_mat)
-            # 이미 왜곡을 폈으므로, 이후 solvePnP에서는 왜곡 파라미터 무시 (이중 보정 방지)
-            pnp_dist_coeffs = None
             
         gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
         if self.detector is not None:

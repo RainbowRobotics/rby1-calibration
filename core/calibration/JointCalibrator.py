@@ -49,7 +49,7 @@ class JointCalibrator(BaseCalibrator):
         super().__init__(marker_st, robot)
         self.use_angle_based_fitting = True
 
-    def perform_joint_calibration(self, arm_side, mode, log_callback=None, status_callback=None, current_offset_deg=0.0, sweep_duration=20.0, use_angle_based_fitting=None, save_debug=False, pass_idx=1, pass1_res=None):
+    def perform_joint_calibration(self, arm_side, mode, log_callback=None, status_callback=None, current_offset_deg=0.0, sweep_duration=12.0, use_angle_based_fitting=None, save_debug=False, pass_idx=1, pass1_res=None):
         if use_angle_based_fitting is None:
             use_angle_based_fitting = getattr(self, 'use_angle_based_fitting', True)
 
@@ -180,7 +180,7 @@ class JointCalibrator(BaseCalibrator):
                 # Dynamic damping: halve the damping factor if the correction direction flips
                 # This squashes noise-floor oscillations rapidly
                 if i > 1 and raw_optimal_offset * prev_step_correction < 0:
-                    dynamic_damping *= 0.7
+                    dynamic_damping *= 0.8
                 elif i == 1:
                     dynamic_damping = 1.0
                     
@@ -193,14 +193,14 @@ class JointCalibrator(BaseCalibrator):
                     step_correction_delta = step_correction
 
                 # Convergence check:
-                # step correction delta < 0.1° to handle bracket RPY noise
-                converged_criteria = (abs(step_correction_delta) < 0.1)
+                # step correction delta < 0.06° to handle bracket RPY noise
+                converged_criteria = (abs(step_correction_delta) < 0.06)
                 
                 if converged_criteria:
                     converged = True
                     if log_callback:
                         log_callback(f"\n[SUCCESS] Calibration CONVERGED successfully:")
-                        log_callback(f"  * Step Correction: {step_correction_delta:.4f}° < 0.1° (reached resolution limit)")
+                        log_callback(f"  * Step Correction: {step_correction_delta:.4f}° < 0.06° (reached resolution limit)")
                         log_callback(f"  * Recommended Absolute Offset: {staged_offset:.4f}°")
                     break
                 
@@ -230,7 +230,7 @@ class JointCalibrator(BaseCalibrator):
             if not converged and len(staged_offsets_history) >= 3:
                 avg_offset = float(np.mean(staged_offsets_history[-3:]))
                 if log_callback:
-                    log_callback(f"\n[INFO] Joint {mode} did not meet 0.1° convergence tolerance due to measurement noise floor.")
+                    log_callback(f"\n[INFO] Joint {mode} did not meet 0.06° convergence tolerance due to measurement noise floor.")
                     log_callback(f"       Damping fallback: Averaged last 3 offsets ({', '.join(f'{v:.4f}°' for v in staged_offsets_history[-3:])}) -> {avg_offset:.4f}°")
                 staged_offset = avg_offset
 
@@ -616,7 +616,7 @@ class JointCalibrator(BaseCalibrator):
                 log_callback(traceback.format_exc())
             return None
 
-    def perform_calibration_sweep_continuous(self, arm_side, mode, log_callback=None, status_callback=None, current_offset_deg=0.0, sweep_duration=20.0, use_angle_based_fitting=None, save_debug=False):
+    def perform_calibration_sweep_continuous(self, arm_side, mode, log_callback=None, status_callback=None, current_offset_deg=0.0, sweep_duration=12.0, use_angle_based_fitting=None, save_debug=False):
         if getattr(self, 'stop_requested', False):
             return None
 
@@ -633,12 +633,21 @@ class JointCalibrator(BaseCalibrator):
         is_camera_mock = (self.marker_st is None or type(self.marker_st).__name__ == "SimulatedMarkerTransform")
 
         if not is_camera_mock:
-            # Pre-check marker visibility
+            # Pre-check marker visibility after settling delay
+            time.sleep(1.0)
             initial_check = self.marker_st.get_marker_transform(sampling_time=2.0, side=arm_side)
             if not initial_check:
                 if log_callback: log_callback("[ERROR] Marker is not visible.")
-                if status_callback: status_callback(False)
-                return None
+                if hasattr(self, 'marker_problem_callback') and self.marker_problem_callback:
+                    if log_callback: log_callback("[INFO] Prompting user for manual teaching due to marker visibility error...")
+                    resolved = self.marker_problem_callback(arm_side)
+                    if resolved:
+                        self.perform_move_to_ready_pose(arm_side, mode=mode, log_callback=log_callback)
+                        time.sleep(1.0)
+                        initial_check = self.marker_st.get_marker_transform(sampling_time=2.0, side=arm_side)
+                if not initial_check:
+                    if status_callback: status_callback(False)
+                    return None
             if status_callback: status_callback(True)
         else:
             if status_callback: status_callback(True)
@@ -663,7 +672,13 @@ class JointCalibrator(BaseCalibrator):
         # Arm cand baseline pose (shifted by current offset)
         ver_key = "v1.3" if self.is_v13() else "v1.2"
         ready_pose_nom = self.get_ready_pose(ver_key, "joint", mode, arm_side)
-        q_cand = list(initial_joint_pos)
+        norm_mode = "wrist_pitch" if mode == "wrist_pitch_v13" else ("wrist_roll" if mode == "wrist_roll_v13" else mode)
+        ref_pose = None
+        if hasattr(self, 'user_taught_ready_poses') and isinstance(self.user_taught_ready_poses, dict):
+            arm_dict = self.user_taught_ready_poses.get(arm_side)
+            if isinstance(arm_dict, dict):
+                ref_pose = arm_dict.get(norm_mode)
+        q_cand = list(ref_pose) if ref_pose is not None else list(initial_joint_pos)
         q_cand[cand_joint] = ready_pose_nom[cand_joint] + np.radians(current_offset_deg)
 
         # Determine sweep ranges from JOINT_CONFIGS
@@ -675,7 +690,7 @@ class JointCalibrator(BaseCalibrator):
         dataset_A = self.perform_single_joint_sweep(
             arm_side, sweep_joint_A, q_cand, -range_A, range_A, sweep_duration,
             q_head=None, label="Joint A", log_callback=log_callback,
-            current_offset_deg=current_offset_deg, cand_joint=cand_joint
+            current_offset_deg=current_offset_deg, cand_joint=cand_joint, mode=mode
         )
         if dataset_A is None:
             return None
@@ -684,32 +699,31 @@ class JointCalibrator(BaseCalibrator):
             return None
             
         if self.robot:
-            time.sleep(1.0)
+            time.sleep(0.5)
         else:
             time.sleep(0.01)
 
         # 2. PHYSICAL SWEEP JOINT B
+        norm_mode = "wrist_pitch" if mode == "wrist_pitch_v13" else ("wrist_roll" if mode == "wrist_roll_v13" else mode)
+        if hasattr(self, 'user_taught_ready_poses') and isinstance(self.user_taught_ready_poses, dict):
+            arm_dict = self.user_taught_ready_poses.get(arm_side)
+            if isinstance(arm_dict, dict):
+                ref_pose = arm_dict.get(norm_mode)
+                if ref_pose is not None:
+                    q_cand = list(ref_pose)
+                    q_cand[cand_joint] = ready_pose_nom[cand_joint] + np.radians(current_offset_deg)
+
         logging.info(f"\n--- Commencing Continuous Sweep on Joint B (Index {sweep_joint_B}, duration={sweep_duration}s) ---")
         dataset_B = self.perform_single_joint_sweep(
             arm_side, sweep_joint_B, q_cand, -range_B, range_B, sweep_duration,
             q_head=None, label="Joint B", log_callback=log_callback,
-            current_offset_deg=current_offset_deg, cand_joint=cand_joint
+            current_offset_deg=current_offset_deg, cand_joint=cand_joint, mode=mode
         )
-        if dataset_B is None:
-            return None
+        if dataset_A:
+            initial_joint_pos = list(dataset_A[0][0][arm_idx])
 
         if getattr(self, 'stop_requested', False):
-            return None
-
-        # Return arm to original ready pose (head=None)
-        logging.info("[INFO] Sweep finished. Returning arm to initial pose...")
-        if arm_side == "left":
-            ok = self.movej(self.robot, left_arm=initial_joint_pos, head=None, minimum_time=2.5, apply_offsets=False)
-        else:
-            ok = self.movej(self.robot, right_arm=initial_joint_pos, head=None, minimum_time=2.5, apply_offsets=False)
-
-        if not ok or getattr(self, 'stop_requested', False):
-            if log_callback: log_callback("[ERROR] Failed to return arm to initial pose or stop was requested.")
+            if log_callback: log_callback("[INFO] Stop requested during sweep.")
             return None
 
         # Save FULL captured continuous sweep points to debug txt files before downsampling
@@ -965,19 +979,23 @@ class JointCalibrator(BaseCalibrator):
                     diff_angle = np.arctan2(np.dot(n5_proj, ref_x), np.dot(n5_proj, ref_y))
                     raw_diff_deg = np.degrees(diff_angle)
                     
-                    # Compensate for the initial ready pose angle of J7 (index 6)
-                    # We must take the J7 angle from dataset_B (the J5 sweep), because during dataset_A (the J6 sweep), J7 is moving.
+                    # Compensate for the initial nominal ready pose angle of J7 (index 6)
+                    # We take J7 angle from dataset_B and subtract any current staged offset to get the true nominal initial pose
                     q_full_B_first = dataset_B[0][0]
-                    j7_ready_pose_deg = np.degrees(q_full_B_first[arm_idx[6]])
+                    j7_current_pos_deg = np.degrees(q_full_B_first[arm_idx[6]])
                     
-                    # Due to kinematics, the apparent marker rotation is the negative of the actual J7 rotation:
-                    # raw_diff_deg = - (j7_ready_pose_deg + physical_offset)
-                    # physical_offset = - raw_diff_deg - j7_ready_pose_deg
-                    # We must return the compensation offset (correction), which is the negative of the physical offset:
-                    optimal_offset_deg = raw_diff_deg + j7_ready_pose_deg
+                    staged_j7_offset_deg = 0.0
+                    if hasattr(self, 'joint_offsets') and self.joint_offsets:
+                        offsets = self.joint_offsets[arm_side] if arm_side in self.joint_offsets else self.joint_offsets
+                        staged_j7_offset_deg = offsets.get("wrist_roll" if self.is_v13() else "wrist_yaw2", 0.0)
+                    
+                    j7_ready_pose_deg = j7_current_pos_deg - staged_j7_offset_deg
+                    # For absolute recommended offset, we simply add raw_diff_deg to the actual J7 position (which already contains any applied offset).
+                    # This ensures optimal_offset_deg is always the total physical offset relative to nominal ready pose.
+                    optimal_offset_deg = raw_diff_deg + j7_current_pos_deg
                     
                     if log_callback:
-                        log_callback(f"[INFO] {mode}: J7 ready pose={j7_ready_pose_deg:.2f}°, raw_diff={raw_diff_deg:.2f}°, optimal_offset={optimal_offset_deg:.2f}°")
+                        log_callback(f"[INFO] {mode}: J7 nominal ready pose={j7_ready_pose_deg:.2f}°, raw_diff={raw_diff_deg:.2f}°, optimal_offset={optimal_offset_deg:.2f}°")
             except Exception as e:
                 import traceback
                 if log_callback:

@@ -11,9 +11,10 @@ class AutoCollectionConfig:
     position_step_m: float = 0.03
     step_x_m: float = 0.03
     max_x: float = 0.5
-    move_time: float = 2.4
-    settle_time: float = 0.6
-    hold_time: float = 0.5
+    max_loops: int = 1
+    move_time: float = 1.8
+    settle_time: float = 0.4
+    hold_time: float = 0.4
     priority: int = 10
 
 def rot_x(rad):
@@ -111,20 +112,23 @@ def reset_motion_state():
         "p_marker_0": None,
     }
 
-def build_incremental_motion_plan(robot, dyn_model, config: AutoCollectionConfig, active_arms=["right", "left"]):
+def build_incremental_motion_plan(robot, dyn_model, config: AutoCollectionConfig, active_arms=["right", "left"], include_head_motion=True):
     """
-    현재 자세를 읽어서 X축으로 전진하며 RPY/YZ 오프셋 타겟들과 헤드 트래킹 타겟 각도들을 생성합니다.
+    현재 자세를 읽어서 X축으로 전진하며 RPY/YZ 오프셋 타겟들과 헤드 트래킹 타겟 각도들을 생성합니다. (최대 2루프, 총 82개 포즈로 구성)
     """
     reset_motion_state()
+    if robot is None:
+        raise RuntimeError("Robot is not connected.")
     state = robot.get_state()
     if state is None or getattr(state, 'position', None) is None:
-        raise RuntimeError("Robot state position is None. Please check connection.")
+        raise RuntimeError("Failed to get robot joint states.")
     q_full = np.array(state.position)
     _, T_base_right = compute_fk(robot, dyn_model, q_full, "ee_right", "link_torso_5")
     _, T_base_left = compute_fk(robot, dyn_model, q_full, "ee_left", "link_torso_5")
     
     model = robot.model()
-    head_idx = model.head_idx[:2] if len(model.head_idx) >= 2 else None
+    head_idx = model.head_idx[:2] if (len(model.head_idx) >= 2 and include_head_motion) else None
+    has_head = head_idx is not None
     q_head_0 = q_full[head_idx].copy() if head_idx is not None else None
     
     try:
@@ -146,33 +150,60 @@ def build_incremental_motion_plan(robot, dyn_model, config: AutoCollectionConfig
     p_marker_0 = get_marker_midpoint(T_base_right, T_base_left)
     
     plan = []
-    T_curr_right = T_base_right.copy()
-    T_curr_left = T_base_left.copy()
+    T_curr_right = T_base_right.copy() if T_base_right is not None else None
+    T_curr_left = T_base_left.copy() if T_base_left is not None else None
     
-    while True:
+    loop_count = 0
+    max_loops = getattr(config, 'max_loops', 2)
+
+    while loop_count < max_loops:
         curr_x = T_curr_right[0, 3]
         if curr_x > config.max_x:
             break
+        loop_count += 1
             
         half_ang = config.angle_step_deg / 2.0
         full_ang = config.angle_step_deg
 
-        # 1. Joint steps for joint 0, 1, and 4
-        joint_offsets = [-half_ang, -full_ang, half_ang, full_ang]
-        for joint_idx in [0, 1, 4]:
-            for offset in joint_offsets:
+        # 1. Joint steps for joint 0, 1, 2, and 4
+        for joint_idx in [0, 1, 2, 4]:
+            if joint_idx == 0 and not has_head:
+                j_offsets = [0.0, -half_ang, -full_ang, half_ang]
+            else:
+                j_offsets = [-half_ang, -full_ang, half_ang, full_ang]
+            for offset in j_offsets:
                 plan.append({
                     "type": "joint",
                     "joint_idx": joint_idx,
                     "offset_deg": offset,
-                    "T_right": T_curr_right.copy(),
-                    "T_left": T_curr_left.copy(),
+                    "T_right": T_curr_right.copy() if T_curr_right is not None else None,
+                    "T_left": T_curr_left.copy() if T_curr_left is not None else None,
                     "desc": f"Joint {joint_idx} Offset: {offset:.1f}deg"
                 })
+
+        # 1.5 Multi-joint diagonal sweeps for J1 and J4 coupling decoupling (full_ang = 5.0deg for high 3D SNR)
+        multi_joint_targets = [
+            ({1:  full_ang, 4:  full_ang}, f"Joint 1+4 (+{full_ang:.1f},+{full_ang:.1f})deg"),
+            ({1:  full_ang, 4: -full_ang}, f"Joint 1+4 (+{full_ang:.1f},-{full_ang:.1f})deg"),
+            ({1: -full_ang, 4:  full_ang}, f"Joint 1+4 (-{full_ang:.1f},+{full_ang:.1f})deg"),
+            ({1: -full_ang, 4: -full_ang}, f"Joint 1+4 (-{full_ang:.1f},-{full_ang:.1f})deg"),
+            ({1:  full_ang, 2:  full_ang}, f"Joint 1+2 (+{full_ang:.1f},+{full_ang:.1f})deg"),
+            ({1: -full_ang, 2: -full_ang}, f"Joint 1+2 (-{full_ang:.1f},-{full_ang:.1f})deg"),
+        ]
+        for off_dict, desc in multi_joint_targets:
+            plan.append({
+                "type": "joint",
+                "joint_idx": None,
+                "offsets_dict": off_dict,
+                "T_right": T_curr_right.copy() if T_curr_right is not None else None,
+                "T_left": T_curr_left.copy() if T_curr_left is not None else None,
+                "desc": desc
+            })
+
         plan.append({
             "type": "restore_baseline",
-            "T_right": T_curr_right.copy(),
-            "T_left": T_curr_left.copy(),
+            "T_right": T_curr_right.copy() if T_curr_right is not None else None,
+            "T_left": T_curr_left.copy() if T_curr_left is not None else None,
             "desc": "Restore Baseline Pose"
         })
 
@@ -184,7 +215,7 @@ def build_incremental_motion_plan(robot, dyn_model, config: AutoCollectionConfig
         for dr, dp, dy in rpy_targets:
             tr = apply_cartesian_offset(T_curr_right, droll_deg=dr, dpitch_deg=dp, dyaw_deg=dy)
             tl = apply_cartesian_offset(T_curr_left, droll_deg=dr, dpitch_deg=dp, dyaw_deg=dy)
-            head_q = compute_head_tracking_q(tr, tl, active_arms, p_neck, q_head_0, p_marker_0)
+            head_q = compute_head_tracking_q(tr, tl, active_arms, p_neck, q_head_0, p_marker_0) if has_head else None
             plan.append({
                 "T_right": tr, "T_left": tl,
                 "head_q": head_q,
@@ -200,7 +231,7 @@ def build_incremental_motion_plan(robot, dyn_model, config: AutoCollectionConfig
         for dx, dy, dz in yz_targets:
             tr = apply_cartesian_offset(T_curr_right, dx=dx, dy=dy, dz=dz)
             tl = apply_cartesian_offset(T_curr_left, dx=dx, dy=dy, dz=dz)
-            head_q = compute_head_tracking_q(tr, tl, active_arms, p_neck, q_head_0, p_marker_0)
+            head_q = compute_head_tracking_q(tr, tl, active_arms, p_neck, q_head_0, p_marker_0) if has_head else None
             plan.append({
                 "T_right": tr, "T_left": tl,
                 "head_q": head_q,
@@ -208,7 +239,7 @@ def build_incremental_motion_plan(robot, dyn_model, config: AutoCollectionConfig
             })
             
         # 4. Independent head motions (Pan Left/Right, Tilt Up/Down)
-        if q_head_0 is not None:
+        if has_head and q_head_0 is not None:
             ang_rad = np.radians(config.angle_step_deg)
             head_targets = [
                 (-ang_rad, 0.0, f"Head Pan: {-config.angle_step_deg:.1f}deg"),
@@ -219,8 +250,8 @@ def build_incremental_motion_plan(robot, dyn_model, config: AutoCollectionConfig
             for d_pan, d_tilt, desc in head_targets:
                 hq = np.array([q_head_0[0] + d_pan, q_head_0[1] + d_tilt], dtype=np.float64)
                 plan.append({
-                    "T_right": T_curr_right.copy(),
-                    "T_left": T_curr_left.copy(),
+                    "T_right": T_curr_right.copy() if T_curr_right is not None else None,
+                    "T_left": T_curr_left.copy() if T_curr_left is not None else None,
                     "head_q": hq,
                     "desc": desc
                 })
@@ -230,17 +261,23 @@ def build_incremental_motion_plan(robot, dyn_model, config: AutoCollectionConfig
         
     return plan
 
-def move_to_auto_ready_pose(robot, active_arms, minimum_time=5.0, priority=10):
+def move_to_auto_ready_pose(robot, active_arms, minimum_time=5.0, priority=10, include_head_motion=True):
+    model = robot.model() if robot else None
+    has_head = (include_head_motion) and (model is not None and hasattr(model, 'head_idx') and len(getattr(model, 'head_idx', [])) >= 2)
+    
     # Step 1: Joint Ready Pose (go_to_ready_pose 기준)
     q_torso = np.array([0, 30, -60, 30, 0, 0], dtype=np.float64) * D2R
     
+    # Lower Shoulder Pitch (Joint 0) by 15 deg if no 2-DOF head (fixed chest camera)
+    j0_pitch = -30.0 if not has_head else -45.0
+    
     if "right" in active_arms:
-        q_right = np.array([-45, -30, 0, -90, 0, 45, 0], dtype=np.float64) * D2R
+        q_right = np.array([j0_pitch, -30, 0, -90, 0, 45, 0], dtype=np.float64) * D2R
     else:
         q_right = np.array([0, 0, 0, -90, 0, 0, 0], dtype=np.float64) * D2R
         
     if "left" in active_arms:
-        q_left = np.array([-45, 30, 0, -90, 0, 45, 0], dtype=np.float64) * D2R
+        q_left = np.array([j0_pitch, 30, 0, -90, 0, 45, 0], dtype=np.float64) * D2R
     else:
         q_left = np.array([0, 0, 0, -90, 0, 0, 0], dtype=np.float64) * D2R
         
@@ -258,12 +295,12 @@ def move_to_auto_ready_pose(robot, active_arms, minimum_time=5.0, priority=10):
     if rv1.finish_code != rby.RobotCommandFeedback.FinishCode.Ok:
         raise RuntimeError("Failed to move to Step 1: Joint Ready Pose.")
 
-    # Step 2: Cartesian Checking Pose (go_to_calibration_checking_pose 기준, offset=0.2)
-    # Raising Z-axis to 0.2m (down 20cm from previous 0.4m) and rotating 6th axis (wrist) by 180 degrees (@ rot_z(180))
-    T_right = make_T(rot_z(0*D2R) @ rot_y(-90*D2R) @ rot_x(90*D2R), [0.3, -0.15, 0.25])
+    # Step 2: Cartesian Checking Pose (Lower Z to 0.18m for fixed chest camera vs 0.3m for head)
+    z_height = 0.18 if not has_head else 0.3
+    T_right = make_T(rot_z(0*D2R) @ rot_y(-90*D2R) @ rot_x(90*D2R), [0.3, -0.15, z_height])
     T_right[:3, :3] = T_right[:3, :3] @ rot_z(180*D2R)
     
-    T_left = make_T(rot_z(0*D2R) @ rot_y(-90*D2R) @ rot_x(-90*D2R), [0.3, 0.15, 0.25])
+    T_left = make_T(rot_z(0*D2R) @ rot_y(-90*D2R) @ rot_x(-90*D2R), [0.3, 0.15, z_height])
     T_left[:3, :3] = T_left[:3, :3] @ rot_z(180*D2R)
 
     body2 = rby.BodyComponentBasedCommandBuilder()
@@ -395,13 +432,15 @@ def execute_auto_motion_step(robot, config, motion_plan_step, active_arms, inclu
         model = robot.model()
         dyn_model = robot.get_dynamics()
 
-        # Save baseline configurations if not already saved
+        # Save baseline configurations independently if not already saved
         if _motion_state["q_right_baseline"] is None:
             _motion_state["q_right_baseline"] = q_full[model.right_arm_idx[:7]].copy()
             _motion_state["q_left_baseline"] = q_full[model.left_arm_idx[:7]].copy()
+
+        if include_head_motion and _motion_state["q_head_baseline"] is None:
             head_idx = model.head_idx[:2] if len(model.head_idx) >= 2 else None
             _motion_state["q_head_baseline"] = q_full[head_idx].copy() if head_idx is not None else None
-            _motion_state["q_head_0"] = _motion_state["q_head_baseline"].copy() if head_idx is not None else None
+            _motion_state["q_head_0"] = _motion_state["q_head_baseline"].copy() if _motion_state["q_head_baseline"] is not None else None
 
             _, T_base_right = compute_fk(robot, dyn_model, q_full, "ee_right", "link_torso_5")
             _, T_base_left = compute_fk(robot, dyn_model, q_full, "ee_left", "link_torso_5")
@@ -422,19 +461,45 @@ def execute_auto_motion_step(robot, config, motion_plan_step, active_arms, inclu
             else:
                 _motion_state["p_marker_0"] = None
 
+        if _motion_state["q_right_baseline"] is None:
+            _motion_state["q_right_baseline"] = q_full[model.right_arm_idx[:7]].copy()
+        if _motion_state["q_left_baseline"] is None:
+            _motion_state["q_left_baseline"] = q_full[model.left_arm_idx[:7]].copy()
+
         q_right_target = _motion_state["q_right_baseline"].copy()
         q_left_target = _motion_state["q_left_baseline"].copy()
 
-        j_idx = motion_plan_step["joint_idx"]
-        offset_deg = motion_plan_step["offset_deg"]
+        if "offsets_dict" in motion_plan_step and motion_plan_step["offsets_dict"] is not None:
+            for j_i, off_deg in motion_plan_step["offsets_dict"].items():
+                if j_i == 2:
+                    if "right" in active_arms:
+                        q_right_target[j_i] += np.deg2rad(off_deg)
+                    if "left" in active_arms:
+                        q_left_target[j_i] += np.deg2rad(-off_deg)
+                else:
+                    if "right" in active_arms:
+                        q_right_target[j_i] += np.deg2rad(off_deg)
+                    if "left" in active_arms:
+                        q_left_target[j_i] += np.deg2rad(off_deg)
+            j_idx = list(motion_plan_step["offsets_dict"].keys())[0]
+        else:
+            j_idx = motion_plan_step["joint_idx"]
+            offset_deg = motion_plan_step["offset_deg"]
 
-        if "right" in active_arms:
-            q_right_target[j_idx] += np.deg2rad(offset_deg)
-        if "left" in active_arms:
-            q_left_target[j_idx] += np.deg2rad(offset_deg)
+            if j_idx == 2:
+                # Joint 2 (Shoulder Yaw): Opposing rotation to keep both markers in camera FOV
+                if "right" in active_arms:
+                    q_right_target[j_idx] += np.deg2rad(offset_deg)
+                if "left" in active_arms:
+                    q_left_target[j_idx] += np.deg2rad(-offset_deg)
+            else:
+                if "right" in active_arms:
+                    q_right_target[j_idx] += np.deg2rad(offset_deg)
+                if "left" in active_arms:
+                    q_left_target[j_idx] += np.deg2rad(offset_deg)
 
         head_q = None
-        if j_idx == 0 and include_head_motion:
+        if include_head_motion:
             q_full_temp = q_full.copy()
             q_full_temp[model.right_arm_idx[:7]] = q_right_target
             q_full_temp[model.left_arm_idx[:7]] = q_left_target
@@ -450,8 +515,6 @@ def execute_auto_motion_step(robot, config, motion_plan_step, active_arms, inclu
                 _motion_state["q_head_0"],
                 _motion_state["p_marker_0"]
             )
-        elif include_head_motion:
-            head_q = _motion_state["q_head_baseline"]
 
         cmd = make_dual_arm_head_cmd(
             T_right=None,
@@ -486,8 +549,8 @@ def execute_auto_motion_step(robot, config, motion_plan_step, active_arms, inclu
             if rv.finish_code != rby.RobotCommandFeedback.FinishCode.Ok:
                 raise RuntimeError(f"Restore baseline command failed: {rv.finish_code}")
 
-            # Clear the baseline state
-            reset_motion_state()
+            # Maintain the baseline state for remaining steps in the plan
+            pass
 
         time.sleep(config.settle_time)
         return motion_plan_step

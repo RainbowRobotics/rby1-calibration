@@ -415,47 +415,68 @@ class QPCalibrationOptimizer:
 
             if getattr(self, 'apply_joint_offset_limits', False) and getattr(self, 'joint_offsets_to_apply', None) is not None:
                 jo = self.joint_offsets_to_apply  
-                r_j3 = jo.get("right", {}).get("joint3", 0.0)
-                l_j3 = jo.get("left", {}).get("joint3", 0.0)
-
-                v1_r3 = (-r_j3 - 0.1) * D2R
-                v2_r3 = (-r_j3 + 0.1) * D2R
-                q_lower[3] = min(v1_r3, v2_r3)
-                q_upper[3] = max(v1_r3, v2_r3)
-
-                v1_l3 = (-l_j3 - 0.1) * D2R
-                v2_l3 = (-l_j3 + 0.1) * D2R
-                q_lower[10] = min(v1_l3, v2_l3)
-                q_upper[10] = max(v1_l3, v2_l3)
-                # In 1.2, Joint 5 is calibrated
-                r_j5 = jo.get("right", {}).get("joint5", 0.0)
-                l_j5 = jo.get("left", {}).get("joint5", 0.0)
+                if len(self.active_arms) == 1:
+                    side = self.active_arms[0]
+                    j3_val = jo.get(side, {}).get("joint3", 0.0)
+                    j5_val = jo.get(side, {}).get("joint5", 0.0)
+                    j6_val = jo.get(side, {}).get("joint6", 0.0)
                     
-                v1_r5 = (-r_j5 - 0.001) * D2R
-                v2_r5 = (-r_j5 + 0.001) * D2R
-                q_lower[5] = min(v1_r5, v2_r5)
-                q_upper[5] = max(v1_r5, v2_r5)
+                    v1_j3 = (-j3_val - 0.05) * D2R
+                    v2_j3 = (-j3_val + 0.05) * D2R
+                    q_lower[3] = min(v1_j3, v2_j3)
+                    q_upper[3] = max(v1_j3, v2_j3)
 
-                v1_l5 = (-l_j5 - 0.001) * D2R
-                v2_l5 = (-l_j5 + 0.001) * D2R
-                q_lower[12] = min(v1_l5, v2_l5)
-                q_upper[12] = max(v1_l5, v2_l5)
+                    v1_j5 = (-j5_val - 0.05) * D2R
+                    v2_j5 = (-j5_val + 0.05) * D2R
+                    q_lower[5] = min(v1_j5, v2_j5)
+                    q_upper[5] = max(v1_j5, v2_j5)
 
-                # Joint 6 오프셋 제한 범위 추가 (오른쪽: index 6, 왼쪽: index 13)
-                r_j6 = jo.get("right", {}).get("joint6", 0.0)
-                l_j6 = jo.get("left", {}).get("joint6", 0.0)
+                    v1_j6 = (-j6_val - 0.05) * D2R
+                    v2_j6 = (-j6_val + 0.05) * D2R
+                    q_lower[6] = min(v1_j6, v2_j6)
+                    q_upper[6] = max(v1_j6, v2_j6)
+                else:
+                    r_j3 = jo.get("right", {}).get("joint3", 0.0)
+                    l_j3 = jo.get("left", {}).get("joint3", 0.0)
 
-                v1_r6 = (-r_j6 - 0.1) * D2R
-                v2_r6 = (-r_j6 + 0.1) * D2R
+                    v1_r3 = (-r_j3 - 0.05) * D2R
+                    v2_r3 = (-r_j3 + 0.05) * D2R
+                    q_lower[3] = min(v1_r3, v2_r3)
+                    q_upper[3] = max(v1_r3, v2_r3)
 
-                q_lower[6] = min(v1_r6, v2_r6)
-                q_upper[6] = max(v1_r6, v2_r6)
+                    v1_l3 = (-l_j3 - 0.05) * D2R
+                    v2_l3 = (-l_j3 + 0.05) * D2R
+                    q_lower[10] = min(v1_l3, v2_l3)
+                    q_upper[10] = max(v1_l3, v2_l3)
 
-                v1_l6 = (-l_j6 - 0.1) * D2R
-                v2_l6 = (-l_j6 + 0.1) * D2R
+                    r_j5 = jo.get("right", {}).get("joint5", 0.0)
+                    l_j5 = jo.get("left", {}).get("joint5", 0.0)
+                        
+                    v1_r5 = (-r_j5 - 0.05) * D2R
+                    v2_r5 = (-r_j5 + 0.05) * D2R
+                    q_lower[5] = min(v1_r5, v2_r5)
+                    q_upper[5] = max(v1_r5, v2_r5)
 
-                q_lower[13] = min(v1_l6, v2_l6)
-                q_upper[13] = max(v1_l6, v2_l6)
+                    v1_l5 = (-l_j5 - 0.05) * D2R
+                    v2_l5 = (-l_j5 + 0.05) * D2R
+                    q_lower[12] = min(v1_l5, v2_l5)
+                    q_upper[12] = max(v1_l5, v2_l5)
+
+                    # Joint 6 오프셋 제한 범위 (±0.05도 바운드 적용)
+                    r_j6 = jo.get("right", {}).get("joint6", 0.0)
+                    l_j6 = jo.get("left", {}).get("joint6", 0.0)
+
+                    v1_r6 = (-r_j6 - 0.05) * D2R
+                    v2_r6 = (-r_j6 + 0.05) * D2R
+
+                    q_lower[6] = min(v1_r6, v2_r6)
+                    q_upper[6] = max(v1_r6, v2_r6)
+
+                    v1_l6 = (-l_j6 - 0.05) * D2R
+                    v2_l6 = (-l_j6 + 0.05) * D2R
+
+                    q_lower[13] = min(v1_l6, v2_l6)
+                    q_upper[13] = max(v1_l6, v2_l6)
 
             lower_parts.append(q_lower)
             upper_parts.append(q_upper)
@@ -844,6 +865,35 @@ class QPCalibrationOptimizer:
             if self.lambda_cam_pos > 0.0:
                 H[pos_slice, pos_slice] += self.lambda_cam_pos * np.eye(3)
                 g[pos_slice] += -self.lambda_cam_pos * xi_mount_cam[3:]
+
+        # Apply Soft Anchor Penalty to Step 1 calibrated joints (J3, J5, J6) to prevent hard wall clamping
+        if getattr(self, 'apply_joint_offset_limits', False) and getattr(self, 'joint_offsets_to_apply', None) is not None:
+            jo = self.joint_offsets_to_apply
+            anchor_weight = 5000.0  # Strong anchor penalty weight pulling Step 1 joints toward Step 1 values (< 0.02 deg error)
+            if len(self.active_arms) == 1:
+                side = self.active_arms[0]
+                anchors = [
+                    (3, -jo.get(side, {}).get("joint3", 0.0) * D2R),
+                    (5, -jo.get(side, {}).get("joint5", 0.0) * D2R),
+                    (6, -jo.get(side, {}).get("joint6", 0.0) * D2R),
+                ]
+            else:
+                anchors = [
+                    (3,  -jo.get("right", {}).get("joint3", 0.0) * D2R),
+                    (5,  -jo.get("right", {}).get("joint5", 0.0) * D2R),
+                    (6,  -jo.get("right", {}).get("joint6", 0.0) * D2R),
+                    (10, -jo.get("left", {}).get("joint3", 0.0) * D2R),
+                    (12, -jo.get("left", {}).get("joint5", 0.0) * D2R),
+                    (13, -jo.get("left", {}).get("joint6", 0.0) * D2R),
+                ]
+
+            for idx, target_val in anchors:
+                if idx < len(q_arm_offset):
+                    cur_val = q_arm_offset[idx]
+                    H[idx, idx] += anchor_weight
+                    g[idx] += -anchor_weight * (cur_val - target_val)
+
+
 
 
 
