@@ -19,7 +19,11 @@ from robot_motion import check_calibration_state
 
 np.set_printoptions(suppress=True, precision=6)
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+import sys
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
 SETTING_PATH = BASE_DIR / "config" / "setting.yaml"
 DEFAULT_LAMBDA_CAM_POS = 1.0
 DEFAULT_LAMBDA_CAM_ROT = 1.0

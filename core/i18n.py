@@ -25,7 +25,11 @@ class I18nManager(QObject):
 
     def load_translations(self, config_path=None):
         if config_path is None:
-            config_path = os.path.join(os.path.dirname(__file__), "..", "config", "i18n.yaml")
+            import sys
+            if getattr(sys, 'frozen', False):
+                config_path = os.path.join(sys._MEIPASS, "config", "i18n.yaml")
+            else:
+                config_path = os.path.join(os.path.dirname(__file__), "..", "config", "i18n.yaml")
         
         if os.path.exists(config_path):
             try:

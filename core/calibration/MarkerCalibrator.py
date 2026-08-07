@@ -103,10 +103,18 @@ class MarkerCalibrator(BaseCalibrator):
             time.sleep(0.5)
         return True
 
-    def perform_calibration_sweep(self, arm_side, axis_mode, log_callback=None, status_callback=None, use_head_tracking=True, save_debug=False):
+    def perform_calibration_sweep(self, arm_side, axis_mode, log_callback=None, status_callback=None, use_head_tracking=True, save_debug=False, initial_joint_pos=None, pass_idx=1):
         try:
             if getattr(self, 'stop_requested', False):
                 return None
+
+            if save_debug and pass_idx == 1:
+                from core.paths import CONFIG_PATHS
+                result_txt_dir = CONFIG_PATHS["txt_dir"]
+                fname = os.path.join(result_txt_dir, f"sweep_points_{arm_side}_marker_axis_{axis_mode}.txt")
+                if os.path.exists(fname):
+                    try: os.remove(fname)
+                    except: pass
 
             if log_callback:
                 log_callback("\n" + "="*50)
@@ -139,7 +147,8 @@ class MarkerCalibrator(BaseCalibrator):
             state = self.robot.get_state()
             model = self.robot.model()
             arm_idx = model.left_arm_idx if arm_side == "left" else model.right_arm_idx
-            initial_joint_pos = list(state.position[arm_idx])
+            if initial_joint_pos is None:
+                initial_joint_pos = list(state.position[arm_idx])
 
             # Sweep configuration from MARKER_CONFIGS
             axis_str = str(axis_mode).lower()
@@ -161,7 +170,7 @@ class MarkerCalibrator(BaseCalibrator):
             dyn_model = self.robot.get_dynamics()
             
             q_head_start = None
-            if use_head_tracking and head_idx is not None and q_head_0 is not None:
+            if use_head_tracking and self.is_head_active() and head_idx is not None and q_head_0 is not None:
                 q_head_start = q_head_0
 
             dataset = self.perform_single_joint_sweep(
@@ -425,7 +434,7 @@ class MarkerCalibrator(BaseCalibrator):
         L_5_ee_m = L_5_ee / 1000.0
         L_nom_m  = L_5_ee_m  # nominal link length from robot model
 
-        # State vector: [yaw_off, pitch_off, roll_off, d5, d6, x_e, y_e, z_e, L_5_ee] in meters/radians
+        # State vector: [yaw_off, pitch_off, roll_off, d5, d6, x_e, y_e, z_e] in meters/radians
         # Input calib_pitch_deg and calib_roll_deg are compensation offsets. Negated to set physical.
         d5_init = np.radians(-calib_pitch_deg) if calib_pitch_deg is not None else 0.0
         d6_init = np.radians(-calib_roll_deg) if calib_roll_deg is not None else d6_init
@@ -433,18 +442,17 @@ class MarkerCalibrator(BaseCalibrator):
         d5_half = 1e-5 if calib_pitch_deg is not None else np.radians(15.0)
         d6_half = 1e-5 if calib_roll_deg is not None else np.radians(15.0)
 
-        x_state = np.array([0.0, 0.0, 0.0, d5_init, d6_init, x_nom_m, y_nom_m, z_init_m, L_nom_m], dtype=float)
-        x_target = np.array([0.0, 0.0, 0.0, d5_init, d6_init, x_nom_m, y_nom_m, z_init_m, L_nom_m], dtype=float)
+        x_state = np.array([0.0, 0.0, 0.0, d5_init, d6_init, x_nom_m, y_nom_m, z_init_m], dtype=float)
+        x_target = np.array([0.0, 0.0, 0.0, d5_init, d6_init, x_nom_m, y_nom_m, z_init_m], dtype=float)
         # Regularization weights:
         # - v1.2: Minimize regularization weights to 1e-6 to allow complete freedom for exact parameters.
         # - v1.3: Keep original weights.
         if not self.is_v13():
-            w_reg = np.array([1e-6] * 9)
+            w_reg = np.array([1e-6] * 8)
         else:
-            w_reg = np.array([1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-3, 1e-2, 1e-3, 2e-2])
+            w_reg = np.array([1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-3, 1e-2, 1e-3])
 
         # Bounds: z_e uses absolute physical range
-        # L_5_ee bounded tightly around robot-model value (±80 mm)
         # y_e and x_e bounds are extended to ±50 mm for v1.2.
         # roll_off constraint is released to ±30 degrees for v1.2, kept at 0.0 for v1.3.
         yaw_limit = 1e-5 if lock_bracket else np.radians(30.0)
@@ -457,14 +465,12 @@ class MarkerCalibrator(BaseCalibrator):
         x_min = np.array([
             -yaw_limit, -pitch_limit, -roll_limit,
             d5_init - d5_half, d6_init - d6_half,
-            x_nom_m - 0.050, y_min_val, -0.250,
-            L_nom_m - 0.080
+            x_nom_m - 0.050, y_min_val, -0.250
         ])
         x_max = np.array([
             yaw_limit, pitch_limit, roll_limit,
             d5_init + d5_half, d6_init + d6_half,
-            x_nom_m + 0.050, y_max_val, 0.010,
-            L_nom_m + 0.080
+            x_nom_m + 0.050, y_max_val, 0.010
         ])
         x_state = np.clip(x_state, x_min, x_max)
         x_target = np.clip(x_target, x_min, x_max)
@@ -473,7 +479,7 @@ class MarkerCalibrator(BaseCalibrator):
         z_sign = self.get_z_sign(arm_side)
 
         def eval_residuals(x):
-            y_off, p_off, r_off, d5_val, d6_val, xe, ye, ze, L_m = x
+            y_off, p_off, r_off, d5_val, d6_val, xe, ye, ze = x
             R_off = R_scipy.from_euler('ZYX', [y_off, p_off, r_off]).as_matrix()
             R_em = R_off @ R_ee_m_ideal
             
@@ -481,7 +487,7 @@ class MarkerCalibrator(BaseCalibrator):
                 n6_p = R_em.T @ np.array([1.0, 0.0, 0.0])
                 n5_p = R_em.T @ R_scipy.from_euler('X', -d6_val).as_matrix() @ np.array([0.0, 1.0, 0.0])
                 
-                ze_shifted = ze + z_sign * L_m
+                ze_shifted = ze + z_sign * L_nom_m
                 r6_p = np.sqrt(ye**2 + ze_shifted**2)
                 Z_p = ye * np.sin(d6_val) + ze_shifted * np.cos(d6_val)
                 Y_p = ye * np.cos(d6_val) - ze_shifted * np.sin(d6_val)
@@ -492,7 +498,7 @@ class MarkerCalibrator(BaseCalibrator):
                 
                 r6_p = np.sqrt(xe**2 + ye**2)
                 X_p = xe * np.cos(d6_val) - ye * np.sin(d6_val)
-                Z_p = ze + z_sign * L_m
+                Z_p = ze + z_sign * L_nom_m
                 r5_p = np.sqrt(X_p**2 + Z_p**2)
             
             res = []
@@ -513,7 +519,7 @@ class MarkerCalibrator(BaseCalibrator):
                     r4_p = np.sqrt((xe * np.cos(d5_val) + Z_p * np.sin(d5_val))**2 + Y_p**2)
                 else:
                     Y_p = xe * np.sin(d6_val) + ye * np.cos(d6_val)
-                    r4_p = np.sqrt((ze + z_sign * L_m)**2 + Y_p**2)
+                    r4_p = np.sqrt((ze + z_sign * L_nom_m)**2 + Y_p**2)
                 res.append(radius_4_m - r4_p)
                 
             for idx in range(len(x)):
@@ -546,7 +552,7 @@ class MarkerCalibrator(BaseCalibrator):
             P = H + qp_reg * np.eye(len(x_state))
             q = g
             
-            dx_max = np.array([0.1, 0.1, 0.1, 0.1, 0.1, 0.05, 0.05, 0.05, 0.05])
+            dx_max = np.array([0.1, 0.1, 0.1, 0.1, 0.1, 0.05, 0.05, 0.05])
             lb = np.maximum(-dx_max, x_min - x_state)
             ub = np.minimum(dx_max, x_max - x_state)
             
@@ -559,11 +565,11 @@ class MarkerCalibrator(BaseCalibrator):
             if np.linalg.norm(dx) < eps_converge:
                 break
 
-        yaw_off_opt, pitch_off_opt, roll_off_opt, d5_opt, d6_opt, xe_opt, ye_opt, ze_opt, L_5_ee_solved = x_state
+        yaw_off_opt, pitch_off_opt, roll_off_opt, d5_opt, d6_opt, xe_opt, ye_opt, ze_opt = x_state
         xe_opt = xe_opt * 1000.0
         ye_opt = ye_opt * 1000.0
         ze_opt = ze_opt * 1000.0
-        L_5_ee = L_5_ee_solved * 1000.0  # update with optimized value
+        L_5_ee = L_nom_m * 1000.0  # update with optimized value
 
         # Return compensation offsets (negative of physical offsets)
         opt_delta_5 = -float(np.degrees(d5_opt))

@@ -25,7 +25,7 @@ class BaseCalibrator:
     }
     MARKER_CONFIGS = {
         "axis_4": {"joint_i": 4, "start_deg": -15.0, "end_deg": 15.0, "n_nom_v12": [0.0, 0.0, 1.0], "n_nom_v13": [0.0, 0.0, 1.0]},
-        "axis_5": {"joint_i": 5, "start_deg": -15.0, "end_deg": 15.0, "n_nom_v12": [0.0, 1.0, 0.0], "n_nom_v13": [0.0, 1.0, 0.0]},
+        "axis_5": {"joint_i": 5, "start_deg": 0.0, "end_deg": -30.0, "n_nom_v12": [0.0, 1.0, 0.0], "n_nom_v13": [0.0, 1.0, 0.0]},
         "axis_6": {"joint_i": 6, "start_deg": -15.0, "end_deg": 15.0, "n_nom_v12": [0.0, 0.0, 1.0], "n_nom_v13": [1.0, 0.0, 0.0]},
     }
     MOCK_GT_OFFSETS = {
@@ -98,8 +98,8 @@ class BaseCalibrator:
                 self.user_taught_ready_poses.clear()
 
     def load_ready_poses(self):
-        config_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config"))
-        yaml_path = os.path.join(config_dir, "ready_poses.yaml")
+        from core.paths import CONFIG_PATHS
+        yaml_path = CONFIG_PATHS["ready_poses_yaml"]
         if os.path.exists(yaml_path):
             try:
                 with open(yaml_path, "r", encoding="utf-8") as f:
@@ -155,8 +155,8 @@ class BaseCalibrator:
             # If Head is disabled or robot has no 2-DOF head (fixed chest camera), lower Shoulder Pitch (Joint 0) by 15 deg
             # to ensure markers stay within the fixed camera FOV instead of rising above it.
             if not self.is_head_active() and len(val_arr) >= 7:
-                val_arr[0] += 20.0  # Joint 0 positive pitch lowers the arm down into fixed FOV (-55 -> -35 deg)
-                msg = f"[READY POSE] Head disabled (Fixed Chest Camera): Joint 0 pitch lowered by +20° ({val_arr[0]:.1f}°) for {arm_side}_arm ({type_key})"
+                val_arr[0] += 15.0  # Joint 0 positive pitch lowers the arm down into fixed FOV (-55 -> -40 deg)
+                msg = f"[READY POSE] Head disabled (Fixed Chest Camera): Joint 0 pitch lowered by +15° ({val_arr[0]:.1f}°) for {arm_side}_arm ({type_key})"
                 print(msg)
                 logging.info(msg)
 
@@ -170,8 +170,8 @@ class BaseCalibrator:
 
     def load_camera_config(self):
         # Locate setting.yaml
-        config_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config"))
-        yaml_path = os.path.join(config_dir, "setting.yaml")
+        from core.paths import CONFIG_PATHS
+        yaml_path = CONFIG_PATHS["setting_yaml"]
         if os.path.exists(yaml_path):
             try:
                 with open(yaml_path, "r", encoding="utf-8") as f:
@@ -294,7 +294,12 @@ class BaseCalibrator:
 
         # Check if both arms' servos are ON
         try:
-            is_servo_ok = robot.is_servo_on(".*")
+            include_head = getattr(self, 'include_head_motion', True)
+            if hasattr(self, 'app') and hasattr(self.app, 'include_head_motion'):
+                include_head = self.app.include_head_motion
+            
+            pattern = ".*" if include_head else "^(?!head_joint_).*$"
+            is_servo_ok = robot.is_servo_on(pattern)
         except Exception as e:
             logging.warning(f"Failed to check servo status: {e}")
             is_servo_ok = False
@@ -341,7 +346,11 @@ class BaseCalibrator:
                     logging.warning(f"Failed to disable control manager: {e}")
             
             logging.info("Turning servos on...")
-            if not robot.servo_on(".*"):
+            include_head = getattr(self, 'include_head_motion', True)
+            if hasattr(self, 'app') and hasattr(self.app, 'include_head_motion'):
+                include_head = self.app.include_head_motion
+            pattern = ".*" if include_head else "^(?!head_joint_).*$"
+            if not robot.servo_on(pattern):
                 logging.error("Failed to turn servos on.")
             else:
                 time.sleep(0.5)
@@ -1080,16 +1089,17 @@ class BaseCalibrator:
             fig, axes = plt.subplots(2, 2, figsize=(14, 12))
 
             def plot_column(res, col_idx, stage_name):
-                pts_a = res['pts_a_cam']
-                pts_b = res['pts_b_cam']
-                c_A = res['c_A']
-                c_B = res['c_B']
-                n_A = res['n_A']
-                n_B = res['n_B']
-                r_A = res['r_A']
-                r_B = res['r_B']
-                angle_error = res['angle_between_normals']
-                center_dist = res['center_dist']
+                plot_data = res.get('_plot_data', res)
+                pts_a = plot_data['pts_a_cam']
+                pts_b = plot_data['pts_b_cam']
+                c_A = plot_data['c_A']
+                c_B = plot_data['c_B']
+                n_A = plot_data['n_A']
+                n_B = plot_data['n_B']
+                r_A = plot_data['r_A']
+                r_B = plot_data['r_B']
+                angle_error = plot_data['angle_between_normals']
+                center_dist = plot_data['center_dist']
 
                 # Compute local frames algebraically from normals (Z axes)
                 def get_local_vectors(n):

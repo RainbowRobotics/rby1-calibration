@@ -413,6 +413,8 @@ class QPCalibrationOptimizer:
             q_upper[10] =  2.0 * D2R# lep
             # q_upper[12] =  0.1 * D2R# lep
 
+
+
             if getattr(self, 'apply_joint_offset_limits', False) and getattr(self, 'joint_offsets_to_apply', None) is not None:
                 jo = self.joint_offsets_to_apply  
                 if len(self.active_arms) == 1:
@@ -892,6 +894,8 @@ class QPCalibrationOptimizer:
                     cur_val = q_arm_offset[idx]
                     H[idx, idx] += anchor_weight
                     g[idx] += -anchor_weight * (cur_val - target_val)
+
+
 
 
 

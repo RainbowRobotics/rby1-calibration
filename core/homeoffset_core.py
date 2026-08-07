@@ -384,7 +384,11 @@ def validate_home_offset_joint_limits(robot, model, arm="both", include_head=Tru
 
         # Load ready_poses.yaml if available
         import yaml
-        config_dir = Path(__file__).resolve().parent.parent / "config"
+        import sys
+        if getattr(sys, 'frozen', False):
+            config_dir = Path(sys.executable).resolve().parent / "config"
+        else:
+            config_dir = Path(__file__).resolve().parent.parent / "config"
         yaml_path = config_dir / "ready_poses.yaml"
         
         ready_poses_dict = {}
