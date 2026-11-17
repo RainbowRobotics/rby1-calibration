@@ -1,24 +1,91 @@
+from core.storage import FileStorage, ArtifactStorage
 import time
 import logging
 import os
 import numpy as np
-import rby1_sdk as rby
+# import rby1_sdk as rby
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.optimize import least_squares, minimize_scalar
-from scipy.spatial.transform import Rotation as R_scipy
+# from scipy.optimize import least_squares, minimize_scalar
+# from scipy.spatial.transform import Rotation as R_scipy
 from .CalibratorBase import BaseCalibrator
+
+# Step 1 joint-sweep timing (2026-09-15 time reduction): one direction per sweep; all captured
+# frames are fitted (no downsampling) to offset the lower sample count of the shorter sweep.
+JOINT_SWEEP_DURATION_S = 8.0
+# wrist_yaw2 (J6) pairs marker orientation with encoder angles, so a faster one-direction sweep
+# biases it (real test 2026-09-15, right arm, 3 reps: 12 s mean -2.07 std 0.11 vs 8 s mean -2.71
+# std 0.32). Elbow was unaffected (12 s -1.982/0.024 vs 8 s -1.979/0.025).
+# v1.3's J6 (wrist_roll_v13) is estimated the same way, so it gets the same duration (2026-10-15).
+# The v1.3 J5 stage sweeps J6 too: at 8 s its estimate scattered 0.24 deg on the first v1.3 robot run
+# (2026-10-23) while the J6 stage at 12 s held its axis angle to 0.015 deg.
+JOINT_SWEEP_DURATION_BY_MODE_S = {"wrist_yaw2": 12.0, "wrist_roll_v13": 12.0, "wrist_pitch_v13": 12.0}
+# How the v1.2 J6 (wrist_yaw2) offset is estimated.
+#   "position"   : marker positions only -- the angle, about the J6 axis, between the J5 axis and
+#                  the marker's radial offset, compared with the same angle from the URDF.
+#   "orientation": the J5 axis mapped into the marker frame through the measured marker
+#                  orientation (the method up to 2026-09-22).
+# 2026-09-22: a stationary marker seen at different image positions (Step 2 head-only poses) kept
+# its position to 0.2 mm but its measured orientation drifted 0.2-0.36 deg with the image x
+# position (corr ~0.96). Fed into the orientation method in a synthetic sweep, 0.25 deg per 100 px
+# moved the right J6 estimate by 0.6 deg (the size of the bias seen on the robot); the position
+# method does not use the orientation. Its gauge is the bracket's lateral x (1 mm ~ 1 deg), which
+# is the same bracket model Step 2 uses, whereas the orientation method's gauge is the bracket yaw.
+# Kept on "orientation": on the real 11:22 left-arm sweep, taken with J6 verified by eye, the
+# orientation method read -0.82 deg and the position method +1.17 deg -- they miss in opposite
+# directions, i.e. the bracket mounting (yaw vs lateral x, the J6 gauge) dominates either way.
+WRIST_YAW2_METHOD = "orientation"
+# Both methods are always computed and reported (2026-09-29); a larger disagreement is logged as a
+# warning. They miss for different reasons (marker-orientation bias vs bracket lateral mounting).
+WRIST_YAW2_METHOD_DISAGREE_WARN_DEG = 0.5
+
+
+def choose_wrist_yaw2_offset(orientation_deg, position_deg, method):
+    """The J6 offset to use and the position-minus-orientation disagreement (None when the position
+    estimate is unavailable). "position" falls back to the orientation estimate without it."""
+    disagreement = None if position_deg is None else float(position_deg) - float(orientation_deg)
+    if method == "position" and position_deg is not None:
+        return float(position_deg), disagreement
+    return float(orientation_deg), disagreement
+# Which sweeps the v1.2 J6 (wrist_yaw2) offset is computed from in Step 1.
+#   "bracket_sweeps": the marker-bracket J6 (+-30 deg) and J5 (90 -> 50 deg) sweeps Step 1 runs
+#                     at the marker pose just before (wrist_yaw2_from_bracket_sweeps).
+#   "joint_sweeps"  : a dedicated, iterated J6/J5 sweep pair at the wrist_yaw2 joint pose
+#                     (perform_joint_calibration; the method up to 2026-09-22).
+# Both go through the same compute_calibration_results. On 2026-09-22, at the J6 zero the user had
+# checked by eye, the bracket sweeps read -0.07 deg (right) / +0.30 deg (left) while the dedicated
+# sweeps kept reading about -0.9 deg on both arms. The bracket sweeps also save the J6 sweep pairs
+# (2+ iterations x 2 sweeps x 12 s per arm and pass).
+WRIST_YAW2_SOURCE = "bracket_sweeps"
+MAX_FIT_POINTS = 1000
+# Per-sweep target-estimate scatter measured on the real robot (deg). Used as a floor on the
+# sample std so a mean of only 2 agreeing sweeps cannot pass on luck.
+# elbow: 0.025 deg measured with +-20 deg sweeps fitting all frames (2026-09-15); floor 0.05, raised to 0.12 on
+# 2026-10-27: three runs on one v1.2 reset scattered 0.11-0.12 deg per sweep and their means 0.3 deg apart.
+# v1.3 (2026-10-15; before, both fell back to 3 samples and no floor): wrist_roll_v13 is the wrist_yaw2
+# method, so it takes its floor; wrist_pitch_v13 measured 0.06-0.13 deg per sweep pair in the simulator.
+JOINT_ESTIMATE_NOISE_DEG = {"wrist_pitch": 0.03, "wrist_yaw2": 0.06, "elbow": 0.12,
+                            "wrist_roll_v13": 0.06, "wrist_pitch_v13": 0.10}
+MIN_MEAN_SAMPLES_BY_MODE = {"wrist_pitch": 2, "wrist_yaw2": 2, "elbow": 2, "wrist_roll_v13": 2, "wrist_pitch_v13": 2}
+
+
 class DebugLogger:
     def __init__(self, original_log_callback, file_path):
         self.original_log_callback = original_log_callback
         self.file_path = file_path
         self.buffer = []
         
+    # GUI gets only the per-iteration headline (number, offset, pass/fail vs
+    # tolerance) plus warnings/errors/final result; the full bullet-by-bullet
+    # breakdown (circle radii, center distance, etc. -- still useful for
+    # offline debugging) is always buffered below and written to
+    # joint_calib_debug_{arm}_{mode}.txt regardless of what reaches the GUI.
     def log(self, msg):
         self.buffer.append(msg)
         msg_upper = msg.upper()
         if (
+            "[ALERT]" in msg_upper or
             "[SAFETY WARNING]" in msg_upper or
             "[SUCCESS]" in msg_upper or
             "[ERROR]" in msg_upper or
@@ -26,19 +93,14 @@ class DebugLogger:
             "[INFO]" in msg_upper or
             "[VALIDATION SWEEP]" in msg_upper or
             "[ITERATION" in msg_upper or
-            "RECOMMENDED ABSOLUTE OFFSET" in msg_upper or
-            "STEP CORRECTION" in msg_upper or
-            "COMMENCING" in msg_upper or
-            "SWEPT" in msg_upper or
-            "SWEEP COMPLETE" in msg_upper or
-            "STARTING" in msg_upper
+            "RECOMMENDED ABSOLUTE OFFSET" in msg_upper
         ):
             if self.original_log_callback:
                 self.original_log_callback(msg)
                 
     def save(self):
         try:
-            with open(self.file_path, "a", encoding="utf-8") as f:
+            with FileStorage.open(self.file_path, "a", encoding="utf-8") as f:
                 f.write("\n=== NEW ITERATION ===\n")
                 f.write("\n".join(self.buffer) + "\n")
         except Exception:
@@ -49,29 +111,38 @@ class JointCalibrator(BaseCalibrator):
         super().__init__(marker_st, robot)
         self.use_angle_based_fitting = True
 
-    def perform_joint_calibration(self, arm_side, mode, log_callback=None, status_callback=None, current_offset_deg=0.0, sweep_duration=12.0, use_angle_based_fitting=None, save_debug=False, pass_idx=1, pass1_res=None):
+    @staticmethod
+    def sweep_points_tag(mode, key_type):
+        """Name part of a joint calibration's sweep_points file. The mode is in it because two modes
+        of one arm can sweep the same axis (v1.3: J6 in wrist_roll_v13 and wrist_pitch_v13, J4 in
+        wrist_pitch_v13 and elbow); with the axis alone, the later mode deleted the earlier one's file."""
+        return f"{mode}_{key_type}"
+
+    def perform_joint_calibration(self, arm_side, mode, log_callback=None, status_callback=None, current_offset_deg=0.0, sweep_duration=None, use_angle_based_fitting=None, save_debug=False, pass_idx=1, pass1_res=None):
+        if sweep_duration is None:
+            sweep_duration = JOINT_SWEEP_DURATION_BY_MODE_S.get(mode, JOINT_SWEEP_DURATION_S)
         if use_angle_based_fitting is None:
             use_angle_based_fitting = getattr(self, 'use_angle_based_fitting', True)
 
         config_dir = os.path.abspath(os.path.dirname(__file__))
-        from core.paths import CONFIG_PATHS
+        from core.storage import CONFIG_PATHS
         result_txt_dir = CONFIG_PATHS["txt_dir"]
-        os.makedirs(result_txt_dir, exist_ok=True)
+        FileStorage.ensure_dir(result_txt_dir, exist_ok=True)
         debug_file_path = os.path.join(result_txt_dir, f"joint_calib_debug_{arm_side}_{mode}.txt")
         
         # 처음 시작(pass 1)일 때는 덮어쓰기 위해 기존 파일들 삭제
         if pass_idx == 1:
             if os.path.exists(debug_file_path):
-                try: os.remove(debug_file_path)
+                try: FileStorage.remove(debug_file_path)
                 except: pass
                 
             jcfg = self.JOINT_CONFIGS.get(mode, {})
             for key_type, j_key in [("joint_A", "sweep_joint_A"), ("joint_B", "sweep_joint_B")]:
                 axis = jcfg.get(j_key)
                 if axis is not None:
-                    fname = os.path.join(result_txt_dir, f"sweep_points_{arm_side}_{key_type}_axis_{axis}.txt")
+                    fname = os.path.join(result_txt_dir, f"sweep_points_{arm_side}_{self.sweep_points_tag(mode, key_type)}_axis_{axis}.txt")
                     if os.path.exists(fname):
-                        try: os.remove(fname)
+                        try: FileStorage.remove(fname)
                         except: pass
 
         logger = DebugLogger(log_callback, debug_file_path)
@@ -79,6 +150,7 @@ class JointCalibrator(BaseCalibrator):
         log_callback = logger.log
 
         try:
+            self.current_calib_mode = mode
             self.last_staged_offset = None
             self.last_diff_angle = None
             if original_log:
@@ -86,157 +158,338 @@ class JointCalibrator(BaseCalibrator):
                 log_callback("   STARTING ITERATIVE JOINT CALIBRATION SEQUENCE")
                 log_callback(f"   Target Arm: {arm_side.upper()} | Joint Target: {mode.upper()}")
                 log_callback("="*60 + "\n")
-                
-            first_starting_pose = None
-            if self.robot:
-                try:
-                    state = self.robot.get_state()
-                    model = self.robot.model()
-                    arm_idx = model.left_arm_idx if arm_side == "left" else model.right_arm_idx
-                    first_starting_pose = list(state.position[arm_idx])
-                except Exception:
-                    pass
+            exposure = self.camera_exposure_record()
+            if exposure is not None:
+                log_callback(f"[INFO] Camera exposure for these sweeps: {'auto' if exposure['auto'] else 'manual'}, "
+                             f"setpoint {exposure['setpoint']:.0f} (x {exposure['setpoint_unit_us']:g} us), "
+                             f"last frame {exposure['last_frame_us']:.0f} us")
 
-            # save_debug는 첫 번째 sweep(원본 데이터)에서만 저장
-            _sweep_count = [0]
-            def run_single_sweep(offset):
-                _sweep_count[0] += 1
-                do_save = save_debug and (_sweep_count[0] == 1)
-                return self.perform_calibration_sweep_continuous(
-                    arm_side, mode, log_callback=log_callback, status_callback=status_callback,
-                    current_offset_deg=offset, sweep_duration=sweep_duration,
-                    use_angle_based_fitting=use_angle_based_fitting, save_debug=do_save,
-                    first_starting_pose=first_starting_pose
-                )
-                
-            max_iterations = 6
-            staged_offset = current_offset_deg
-            staged_offsets_history = [staged_offset]
-            final_res = None
-            first_res = None
-            converged = False
-            
-            # Sign-reversal tracking state
-            prev_error = None
-            prev_step_correction = 0.0
-            direction_multiplier = 1.0
-            dynamic_damping = 1.0
-            prev_step_correction = 0.0
-            
-            for i in range(1, max_iterations + 1):
-                # Update self.joint_offsets with staged_offset for proper FK offset subtraction in this iteration
-                jcfg = self.JOINT_CONFIGS.get(mode, {})
-                offset_key = jcfg.get("offset_key")
-                if offset_key:
-                    if arm_side in self.joint_offsets:
-                        self.joint_offsets[arm_side][offset_key] = staged_offset
-                    else:
-                        self.joint_offsets[offset_key] = staged_offset
+            max_readjust_retries = 2
+            readjust_retry_count = 0
+            max_iterations = 8
+            # Mean-based convergence: estimates measured within NEAR_TARGET_DEG of the staged
+            # offset (past the large-step transient) are averaged; converge once the standard
+            # error of that mean is within tolerance.
+            MIN_MEAN_SAMPLES = MIN_MEAN_SAMPLES_BY_MODE.get(mode, 3)
+            ESTIMATE_NOISE_DEG = JOINT_ESTIMATE_NOISE_DEG.get(mode, 0.0)
+            NEAR_TARGET_DEG = 0.3
+            CONVERGENCE_TOL_DEG = 0.06
 
-                if getattr(self, 'stop_requested', False):
-                    if log_callback: log_callback("[INFO] Joint calibration aborted due to stop request.")
-                    return None
+            while True:
+                staged_offset = current_offset_deg
+                staged_offsets_history = [staged_offset]
+                # Per-iteration (staged offset, measured absolute target) pairs for the
+                # noise-floor stability convergence check.
+                target_estimates = []
+                convergence_basis = None
+                final_res = None
+                first_res = None
+                converged = False
+                
+                # Sign-reversal tracking state
+                prev_error = None
+                prev_step_correction = 0.0
+                direction_multiplier = 1.0
+                dynamic_damping = 1.0
+                prev_raw_optimal_offset = None
+                # The actual (post-clamp) staged_offset change applied last iteration, used
+                # to adjust the runaway-step check below for relative/delta modes.
+                prev_applied_step_deg = 0.0
 
-                if log_callback:
-                    log_callback(f"\n[ITERATION {i}/{max_iterations}] Sweeping physically with staged offset {staged_offset:.4f}°...")
+                # Refresh starting pose from robot state in case user taught a new pose
+                first_starting_pose = None
+                if self.robot:
+                    try:
+                        state = self.robot.get_state()
+                        model = self.robot.model()
+                        arm_idx = model.left_arm_idx if arm_side == "left" else model.right_arm_idx
+                        first_starting_pose = list(state.position[arm_idx])
+                    except Exception:
+                        pass
+
+                # The debug plot is saved for the first sweep only (the uncorrected state). The raw
+                # sweep points are saved for every sweep: on 2026-10-06 the elbow estimates scattered
+                # 0.15 deg between sweeps and only the first sweep was on disk to look at.
+                _sweep_count = [0]
+                def run_single_sweep(offset):
+                    _sweep_count[0] += 1
+                    do_save = save_debug and (_sweep_count[0] == 1)
+                    points_note = (f"pass {pass_idx}, sweep {_sweep_count[0]}, staged offset {offset:.4f} deg"
+                                   if save_debug else None)
+                    return self.perform_calibration_sweep_continuous(
+                        arm_side, mode, log_callback=log_callback, status_callback=status_callback,
+                        current_offset_deg=offset, sweep_duration=sweep_duration,
+                        use_angle_based_fitting=use_angle_based_fitting, save_debug=do_save,
+                        debug_points_note=points_note,
+                        first_starting_pose=first_starting_pose,
+                        # the previous sweep of this sequence already saw the marker
+                        skip_visibility_check=(_sweep_count[0] > 1)
+                    )
+
+                restart_sequence = False
                 
-                # Perform physical sweep (or simulated sweep in mock mode) at the current staged offset
-                res = run_single_sweep(staged_offset)
-                if not res:
-                    if log_callback: log_callback(f"[ERROR] Iteration {i} sweep failed. Aborting calibration.")
-                    return None
-                
-                if i == 1:
-                    first_res = res
-                final_res = res
-        
-                angle_error = res.get('angle_between_normals', 0.0)
-                sign = res.get('sign', 1.0)
-                
-                # wrist_roll_v13 has perpendicular axes (target 90 deg), other modes have parallel axes (target 0 deg)
-                if mode == "wrist_roll_v13":
-                    angle_dev = abs(angle_error - 90.0)
-                    center_dist = res.get('perp_dist_after', 999.0)
-                elif mode == "wrist_pitch_v13":
-                    angle_dev = angle_error
-                    center_dist = res.get('perp_dist_after', 999.0)
-                else:
-                    angle_dev = angle_error
-                    center_dist = res.get('center_dist', 999.0)
-                    
-                r_A = res.get('r_A', 0.0)
-                r_B = res.get('r_B', 0.0)
-                size_error = abs(r_A - r_B)
-                current_error = max(size_error, center_dist)
-                
-                # Print iteration summary
-                if log_callback:
-                    if mode in ("wrist_roll_v13", "wrist_pitch_v13"):
-                        log_callback(f"  * Angle Error (Deviation)          : {angle_dev:.4f}°")
-                        log_callback(f"  * Perpendicular Distance (After)   : {center_dist:.4f} mm")
-                        log_callback(f"  * Perpendicular Distance (Before)  : {res.get('perp_dist_before', 999.0):.4f} mm")
-                    else:
-                        log_callback(f"  * Angle Error (Deviation)     : {angle_error:.4f}°")
-                        if mode == "wrist_pitch_v13":
-                            log_callback(f"  * Forearm Length (Center Dist): {center_dist:.4f} mm")
-                            log_callback(f"  * Radii Difference (r3 - r5)  : {size_error:.4f} mm")
+                for i in range(1, max_iterations + 1):
+                    # Update self.joint_offsets with staged_offset for proper FK offset subtraction in this iteration
+                    jcfg = self.JOINT_CONFIGS.get(mode, {})
+                    offset_key = jcfg.get("offset_key")
+                    if offset_key:
+                        if arm_side in self.joint_offsets:
+                            self.joint_offsets[arm_side][offset_key] = staged_offset
                         else:
-                            log_callback(f"  * Circle Size Error (r_A-r_B) : {size_error:.4f} mm")
-                            log_callback(f"  * Center Distance Error       : {center_dist:.4f} mm")
-                            log_callback(f"  * Max Fitting Error Metric    : {current_error:.4f} mm")
-                
-                # Use the pre-calculated damped optimal offset correction to ensure convergence
-                raw_optimal_offset = res.get('optimal_offset', 0.0)
-                
-                # Dynamic damping: halve the damping factor if the correction direction flips
-                # This squashes noise-floor oscillations rapidly
-                if i > 1 and raw_optimal_offset * prev_step_correction < 0:
-                    dynamic_damping *= 0.8
-                elif i == 1:
-                    dynamic_damping = 1.0
-                    
-                step_correction = direction_multiplier * raw_optimal_offset * dynamic_damping
-                
-                # Calculate relative step delta for convergence check
-                if mode in ("wrist_roll_v13", "wrist_yaw2"):
-                    step_correction_delta = step_correction - staged_offset
-                else:
-                    step_correction_delta = step_correction
+                            self.joint_offsets[offset_key] = staged_offset
 
-                # Convergence check:
-                # step correction delta < 0.06° to handle bracket RPY noise
-                converged_criteria = (abs(step_correction_delta) < 0.06)
-                
-                if converged_criteria:
-                    converged = True
+                    if getattr(self, 'stop_requested', False):
+                        if log_callback: log_callback("[INFO] Joint calibration aborted due to stop request.")
+                        return None
+
                     if log_callback:
-                        log_callback(f"\n[SUCCESS] Calibration CONVERGED successfully:")
-                        log_callback(f"  * Step Correction: {step_correction_delta:.4f}° < 0.06° (reached resolution limit)")
-                        log_callback(f"  * Recommended Absolute Offset: {staged_offset:.4f}°")
-                    break
-                
-                # Normal update: apply correction
-                prev_error = angle_dev
-                prev_step_correction = step_correction_delta
-                if mode in ("wrist_roll_v13", "wrist_yaw2"):
-                    # J6 modes return absolute recommended offset, not relative steps.
-                    # Update staged_offset directly with the absolute value.
-                    staged_offset = step_correction
+                        log_callback(f"\n[ITERATION {i}/{max_iterations}] Sweeping physically with staged offset {staged_offset:.4f}°...")
+                    
+                    # Perform continuous sweep at the current staged offset
+                    res = run_single_sweep(staged_offset)
+                    if not res:
+                        if readjust_retry_count < max_readjust_retries and hasattr(self, 'marker_problem_callback') and self.marker_problem_callback:
+                            readjust_retry_count += 1
+                            if log_callback:
+                                log_callback(f"\n[WARNING] Iteration {i} sweep failed (marker lost or insufficient points).")
+                                log_callback(f"[INFO] Prompting user for posture readjustment (Attempt {readjust_retry_count}/{max_readjust_retries})...")
+                            # Reset staged offset in memory before moving
+                            if offset_key:
+                                if arm_side in self.joint_offsets:
+                                    self.joint_offsets[arm_side][offset_key] = current_offset_deg
+                                else:
+                                    self.joint_offsets[offset_key] = current_offset_deg
+                            self.perform_move_to_ready_pose(arm_side, mode=mode, log_callback=log_callback)
+                            resolved = self.marker_problem_callback(arm_side, mode=mode)
+                            if resolved:
+                                if log_callback:
+                                    log_callback(f"[INFO] Posture readjusted. Resetting staged offset to initial ({current_offset_deg:.4f}°) and restarting calibration from Iteration 1...")
+                                self.perform_move_to_ready_pose(arm_side, mode=mode, log_callback=log_callback)
+                                time.sleep(1.0)
+                                restart_sequence = True
+                                break
+                            else:
+                                if log_callback: log_callback("[ERROR] Posture readjustment cancelled by user. Aborting calibration.")
+                                return None
+                        else:
+                            if log_callback: log_callback(f"[ERROR] Iteration {i} sweep failed (consecutive retry limit reached). Aborting calibration.")
+                            return None
+                    
+                    if i == 1:
+                        first_res = res
+                    final_res = res
+            
+                    angle_error = res.get('angle_between_normals', 0.0)
+                    sign = res.get('sign', 1.0)
+                    
+                    # Modes with perpendicular axes (target 90 deg): wrist_yaw2 (v1.2), wrist_roll_v13, wrist_pitch_v13
+                    if mode in ("wrist_yaw2", "wrist_roll_v13", "wrist_pitch_v13"):
+                        angle_dev = abs(angle_error - 90.0)
+                        center_dist = res.get('perp_dist_after', res.get('center_dist', 999.0))
+                    else: # Modes with parallel axes (target 0 deg): wrist_pitch (v1.2), elbow
+                        angle_dev = angle_error
+                        center_dist = res.get('center_dist', 999.0)
+                        
+                    r_A = res.get('r_A', 0.0)
+                    r_B = res.get('r_B', 0.0)
+                    size_error = abs(r_A - r_B)
+                    current_error = max(size_error, center_dist)
+                    
+                    # Print iteration summary
+                    if log_callback:
+                        if mode in ("wrist_yaw2", "wrist_roll_v13", "wrist_pitch_v13"):
+                            log_callback(f"  * Angle Error (from 90.0°)         : {angle_dev:.4f}° (Raw: {angle_error:.4f}°)")
+                            log_callback(f"  * Circle Radii (r_A / r_B)         : {r_A:.1f} mm / {r_B:.1f} mm")
+                            log_callback(f"  * Center Distance                  : {center_dist:.4f} mm")
+                        else:
+                            log_callback(f"  * Angle Error (Deviation)          : {angle_error:.4f}°")
+                            log_callback(f"  * Circle Size Error (r_A-r_B)      : {size_error:.4f} mm")
+                            log_callback(f"  * Center Distance Error            : {center_dist:.4f} mm")
+                            log_callback(f"  * Max Fitting Error Metric         : {current_error:.4f} mm")
+                    
+                    raw_optimal_offset = res.get('optimal_offset', 0.0)
+
+                    # Runtime Anomaly Detection during sweep iterations:
+                    # 1. center_dist > 40.0 mm (ONLY for parallel concentric modes: elbow, wrist_pitch)
+                    # 2. Unexplained jump > 3.5 deg between consecutive raw measurements. Skipped
+                    #    on iteration 1: with no prior measurement there is nothing for a "jump"
+                    #    to be relative to, and a genuinely large true joint offset (e.g. an
+                    #    uncalibrated wrist that is several degrees off) is a normal, correct
+                    #    first reading -- not an anomaly.
+                    #    wrist_roll_v13/wrist_yaw2 report an ABSOLUTE target offset, which should
+                    #    stay stable across iterations regardless of how far staged_offset just
+                    #    moved -- compare the raw values directly.
+                    #    Every other mode (elbow, wrist_pitch, wrist_pitch_v13) reports a RELATIVE
+                    #    remaining-correction, which is *expected* to shrink by roughly the
+                    #    previous iteration's applied step each time -- compare only the part of
+                    #    the jump that isn't explained by that expected shrinkage. Without this
+                    #    adjustment, raising MAX_STEP_CLAMP_DEG (2026-09-14, 1.5->2.5) made a
+                    #    normal convergence step (~2.5 deg) plus ordinary measurement noise
+                    #    (~1 deg) exceed the flat 3.5 deg threshold and falsely abort calibration
+                    #    (observed live on v1.3 wrist_pitch_v13, 2026-09-15).
+                    is_anomalous = False
+                    anomaly_reasons = []
+                    if mode in ("elbow", "wrist_pitch") and center_dist > 40.0:
+                        is_anomalous = True
+                        anomaly_reasons.append(f"Center distance error {center_dist:.2f} mm > 40.0 mm")
+                    if prev_raw_optimal_offset is not None:
+                        raw_jump = raw_optimal_offset - prev_raw_optimal_offset
+                        if mode in ("wrist_roll_v13", "wrist_yaw2"):
+                            unexplained_jump = raw_jump
+                        else:
+                            unexplained_jump = raw_jump + prev_applied_step_deg
+                        if abs(unexplained_jump) > 3.5:
+                            is_anomalous = True
+                            anomaly_reasons.append(
+                                f"Optimal offset jumped {raw_jump:+.2f}° "
+                                f"between iterations ({prev_raw_optimal_offset:.2f}° -> {raw_optimal_offset:.2f}°), "
+                                f"{unexplained_jump:+.2f}° unexplained by the last applied step "
+                                f"({prev_applied_step_deg:+.2f}°) > 3.5° (runaway step)"
+                            )
+                    prev_raw_optimal_offset = raw_optimal_offset
+
+                    if is_anomalous:
+                        if log_callback:
+                            log_callback(f"\n[ALERT] Runtime measurement anomaly detected in Iteration {i}:")
+                            for r in anomaly_reasons:
+                                log_callback(f"  - {r}")
+                        if readjust_retry_count < max_readjust_retries and hasattr(self, 'marker_problem_callback') and self.marker_problem_callback:
+                            readjust_retry_count += 1
+                            if log_callback:
+                                log_callback(f"[INFO] Moving arm to ready pose and prompting user for posture readjustment (Attempt {readjust_retry_count}/{max_readjust_retries})...")
+                            # Reset staged offset in memory before moving
+                            if offset_key:
+                                if arm_side in self.joint_offsets:
+                                    self.joint_offsets[arm_side][offset_key] = current_offset_deg
+                                else:
+                                    self.joint_offsets[offset_key] = current_offset_deg
+                            self.perform_move_to_ready_pose(arm_side, mode=mode, log_callback=log_callback)
+                            resolved = self.marker_problem_callback(arm_side, mode=mode)
+                            if resolved:
+                                if log_callback:
+                                    log_callback(f"[INFO] Posture readjusted. Resetting staged offset to initial ({current_offset_deg:.4f}°) and restarting calibration from Iteration 1...")
+                                self.perform_move_to_ready_pose(arm_side, mode=mode, log_callback=log_callback)
+                                time.sleep(1.0)
+                                restart_sequence = True
+                                break
+                            else:
+                                if log_callback: log_callback("[ERROR] Posture readjustment cancelled by user. Aborting calibration.")
+                                return None
+                        else:
+                            if log_callback:
+                                log_callback(f"[ERROR] Consecutive anomaly retry limit reached ({readjust_retry_count}/{max_readjust_retries}). Aborting calibration.")
+                            return None
+                    
+                    # Calculate raw measurement residual first:
+                    # J6 modes (wrist_roll_v13, wrist_yaw2) return absolute recommended target offset.
+                    # Other modes return relative correction offset.
+                    if mode in ("wrist_roll_v13", "wrist_yaw2"):
+                        raw_residual = direction_multiplier * raw_optimal_offset - staged_offset
+                    else:
+                        raw_residual = direction_multiplier * raw_optimal_offset
+
+                    # Dynamic damping: halve the damping factor if the correction direction flips
+                    # This squashes noise-floor oscillations rapidly
+                    if i > 1 and raw_residual * prev_step_correction < 0:
+                        dynamic_damping *= 0.8
+                    elif i == 1:
+                        dynamic_damping = 1.0
+
+                    # Apply damping to the residual step delta, NEVER directly to the absolute target itself
+                    step_correction_delta = raw_residual * dynamic_damping
+
+                    # Convergence check:
+                    # Based on raw measurement residual (< 0.06°) to ensure genuine physical convergence
+                    # rather than premature termination from small damped steps.
+                    converged_criteria = (abs(raw_residual) < 0.06)
+                    target_estimates.append((staged_offset, staged_offset + raw_residual))
+
+                    if log_callback:
+                        tol_status = "OK (within 0.06°)" if converged_criteria else "retry (exceeds 0.06° tolerance)"
+                        log_callback(
+                            f"[ITERATION {i}/{max_iterations}] offset={staged_offset:.4f}°, "
+                            f"residual={raw_residual:+.4f}° -> {tol_status}"
+                        )
+
+                    # Mean-based convergence: a single sweep's estimate scatters by ~0.05° (J6)
+                    # to ~0.15° (J3), so a lone residual landing inside the tolerance is luck,
+                    # not precision. Average the target estimates measured near the staged
+                    # offset and converge when the standard error of that mean is within
+                    # tolerance.
+                    # A lone in-tolerance residual is not treated as convergence; only the mean is.
+                    converged_criteria = False
+                    near = [e for s, e in target_estimates if abs(e - s) <= NEAR_TARGET_DEG]
+                    if len(near) >= MIN_MEAN_SAMPLES:
+                        est_n = np.array(near)
+                        est_std = max(float(np.std(est_n, ddof=1)), ESTIMATE_NOISE_DEG)
+                        est_se = est_std / np.sqrt(len(est_n))
+                        mean_ok = est_se <= CONVERGENCE_TOL_DEG
+                        if log_callback:
+                            log_callback(
+                                f"  * Mean of {len(est_n)} near-target estimates: {float(np.mean(est_n)):.4f}° "
+                                f"(std={est_std:.4f}°, std err={est_se:.4f}°) -> "
+                                f"{'OK (within 0.06°)' if mean_ok else 'need more samples'}"
+                            )
+                        if mean_ok:
+                            converged = True
+                            convergence_basis = "mean_std_err"
+                            staged_offset = float(np.mean(est_n))
+                            if log_callback:
+                                log_callback(f"\n[SUCCESS] Calibration CONVERGED (mean of repeated sweeps):")
+                                log_callback(f"  * Near-target estimates: {', '.join(f'{v:.4f}°' for v in est_n)}")
+                                log_callback(f"  * Std err {est_se:.4f}° <= {CONVERGENCE_TOL_DEG}°")
+                                log_callback(f"  * Recommended Absolute Offset (mean): {staged_offset:.4f}°")
+                            break
+
+                    if converged_criteria:
+                        converged = True
+                        convergence_basis = "residual"
+                        if mode in ("wrist_roll_v13", "wrist_yaw2"):
+                            # On convergence for absolute modes, record the exact target offset
+                            staged_offset = direction_multiplier * raw_optimal_offset
+                        if log_callback:
+                            log_callback(f"\n[SUCCESS] Calibration CONVERGED successfully:")
+                            log_callback(f"  * Residual Error: {raw_residual:.4f}° < 0.06° (reached resolution limit)")
+                            log_callback(f"  * Recommended Absolute Offset: {staged_offset:.4f}°")
+                        break
+                    
+                    # Normal update: apply correction with per-iteration step clamping.
+                    # 2026-09-14: raised from 1.5deg to 2.5deg to cut iteration count for
+                    # larger real offsets (e.g. right after a motor/joint swap) -- a 5.4deg
+                    # offset now takes ~3 iterations instead of ~5. Kept well under the
+                    # runaway-step anomaly threshold (3.5deg, on the raw per-iteration
+                    # measurement -- see MAX_STEP_CLAMP_DEG usage below and the anomaly
+                    # check a few lines above) so a genuine overshoot/marker-lost event is
+                    # still caught before being acted on.
+                    # 2026-09-15: 2.5 -> 5.0 deg so post-Home-Offset-Reset offsets (3-5 deg) are
+                    # reached in one step.
+                    MAX_STEP_CLAMP_DEG = 5.0
+                    prev_error = angle_dev
+                    prev_step_correction = step_correction_delta
+                    staged_offset_before_step = staged_offset
+                    clamped_step = float(np.clip(step_correction_delta, -MAX_STEP_CLAMP_DEG, MAX_STEP_CLAMP_DEG))
+                    staged_offset = staged_offset + clamped_step
+
+                    # Safety: clamp staged_offset to the joint's configured offset range
+                    jcfg = self.JOINT_CONFIGS.get(mode, {})
+                    off_min, off_max = jcfg.get('offset_range', (-10.0, 10.0))
+                    if staged_offset < off_min or staged_offset > off_max:
+                        if log_callback:
+                            log_callback(f"  [SAFETY WARNING] Staged offset {staged_offset:.4f}° exceeds safe bounds [{off_min}°, {off_max}°]. Clamping.")
+                        staged_offset = float(np.clip(staged_offset, off_min, off_max))
+                    # Record the *actual* change (post safety-clamp too) for next iteration's
+                    # runaway-step check above.
+                    prev_applied_step_deg = staged_offset - staged_offset_before_step
+                        
+                    staged_offsets_history.append(staged_offset)
+                    if log_callback:
+                        log_callback(f"  * Updated Absolute Offset     : {staged_offset:.4f}°")
+                        
+                if restart_sequence:
+                    continue
                 else:
-                    staged_offset += step_correction
-                
-                # Safety: clamp staged_offset to the joint's configured offset range
-                jcfg = self.JOINT_CONFIGS.get(mode, {})
-                off_min, off_max = jcfg.get('offset_range', (-10.0, 10.0))
-                if staged_offset < off_min or staged_offset > off_max:
-                    if log_callback:
-                        log_callback(f"  [SAFETY WARNING] Staged offset {staged_offset:.4f}° exceeds safe bounds [{off_min}°, {off_max}°]. Clamping.")
-                    staged_offset = float(np.clip(staged_offset, off_min, off_max))
-                    
-                staged_offsets_history.append(staged_offset)
-                if log_callback:
-                    log_callback(f"  * Updated Absolute Offset     : {staged_offset:.4f}°")
-                    
+                    break
+
             # Damping fallback for oscillation/noise-floor:
             if not converged and len(staged_offsets_history) >= 3:
                 avg_offset = float(np.mean(staged_offsets_history[-3:]))
@@ -256,13 +509,14 @@ class JointCalibrator(BaseCalibrator):
             if getattr(self, 'stop_requested', False):
                 if log_callback: log_callback("[INFO] Joint calibration aborted before final report.")
                 return None
-        
+
             # Build clean final output dict — UI only needs these fields
             final_output = {
                 'mode': mode,
                 'recommended_joint_offset': staged_offset,
                 'optimal_offset': staged_offset,
                 'converged': converged,
+                'convergence_basis': convergence_basis,
                 'perp_dist_before': final_res.get('perp_dist_before', float('nan')) if final_res else float('nan'),
                 'perp_dist_after': final_res.get('perp_dist_after', float('nan')) if final_res else float('nan'),
                 'axial_offset_mm': final_res.get('axial_offset_mm', float('nan')) if final_res else float('nan'),
@@ -295,6 +549,83 @@ class JointCalibrator(BaseCalibrator):
                 final_output['plot_path_combined'] = plot_path
             
             return final_output
+        finally:
+            self.current_calib_mode = None
+            logger.save()
+
+    def wrist_yaw2_from_bracket_sweeps(self, arm_side, res_6, res_5, log_callback=None, pass_idx=1):
+        """v1.2 J6 (wrist_yaw2) offset from the marker-bracket J6 and J5 sweeps (WRIST_YAW2_SOURCE).
+
+        The bracket's axis-6 and axis-5 sweeps are the J6/J5 sweep pair compute_calibration_results
+        needs, taken at the marker pose: the J5 axis's angle about the J6 axis, against the design
+        bracket, is the J6 offset. That estimate is absolute (it does not depend on the staged J6
+        offset), so one pair gives the answer and nothing moves the robot. res_6 / res_5 are
+        MarkerCalibrator.perform_calibration_sweep results (captured_q_full, captured_poses).
+        Returns a dict shaped like perform_joint_calibration's result, or None without enough data.
+        """
+        mode = "wrist_yaw2"
+        from core.storage import CONFIG_PATHS
+        result_txt_dir = CONFIG_PATHS["txt_dir"]
+        FileStorage.ensure_dir(result_txt_dir, exist_ok=True)
+        debug_file_path = os.path.join(result_txt_dir, f"joint_calib_debug_{arm_side}_{mode}.txt")
+        if pass_idx == 1 and os.path.exists(debug_file_path):
+            try: FileStorage.remove(debug_file_path)
+            except Exception: pass
+        logger = DebugLogger(log_callback, debug_file_path)
+        log = logger.log
+        try:
+            if not self.robot:
+                raise RuntimeError("Robot instance is not initialized or connected.")
+            model = self.robot.model()
+            arm_idx = model.left_arm_idx if arm_side == "left" else model.right_arm_idx
+            dataset_A = list(zip(res_6.get('captured_q_full', []), res_6.get('captured_poses', [])))
+            dataset_B = list(zip(res_5.get('captured_q_full', []), res_5.get('captured_poses', [])))
+            if len(dataset_A) < 20 or len(dataset_B) < 20:
+                log(f"[ERROR] {arm_side} J6 from the bracket sweeps: too few frames "
+                    f"(J6 sweep {len(dataset_A)}, J5 sweep {len(dataset_B)}; need 20 each).")
+                return None
+            if len(dataset_A) > MAX_FIT_POINTS:
+                dataset_A = [dataset_A[i] for i in np.round(np.linspace(0, len(dataset_A) - 1, MAX_FIT_POINTS)).astype(int)]
+            if len(dataset_B) > MAX_FIT_POINTS:
+                dataset_B = [dataset_B[i] for i in np.round(np.linspace(0, len(dataset_B) - 1, MAX_FIT_POINTS)).astype(int)]
+            initial_joint_pos = list(np.asarray(dataset_A[0][0])[arm_idx])
+
+            res = self.compute_calibration_results(arm_side, mode, dataset_A, dataset_B, initial_joint_pos,
+                                                   log_callback=log)
+            offset = float(res['optimal_offset'])
+            converged = not res.get('estimate_failed', False)
+            if not converged:
+                log(f"[ERROR] {arm_side} J6 could not be computed from the bracket sweeps (see the warning above).")
+            off_min, off_max = self.JOINT_CONFIGS[mode].get('offset_range', (-10.0, 10.0))
+            if not off_min <= offset <= off_max:
+                log(f"  [SAFETY WARNING] J6 offset {offset:.4f}° exceeds safe bounds [{off_min}°, {off_max}°]. Clamping.")
+                offset = float(np.clip(offset, off_min, off_max))
+            both = ""
+            if res.get('wrist_yaw2_orientation_deg') is not None:
+                pos = res.get('wrist_yaw2_position_deg')
+                both = (f"; orientation {res['wrist_yaw2_orientation_deg']:+.4f}°, position "
+                        f"{'n/a' if pos is None else f'{pos:+.4f}°'}, method {WRIST_YAW2_METHOD}")
+            log(f"[INFO] {arm_side} J6 (wrist_yaw2) from the bracket sweeps: {offset:+.4f}° "
+                f"(J6 sweep {len(dataset_A)} frames, r {res['r_A']:.1f} mm; J5 sweep {len(dataset_B)} frames, "
+                f"r {res['r_B']:.1f} mm{both})")
+            return {
+                'mode': mode,
+                'recommended_joint_offset': offset,
+                'optimal_offset': offset,
+                'converged': converged,
+                'convergence_basis': 'bracket_sweeps',
+                'wrist_yaw2_method': WRIST_YAW2_METHOD,
+                'wrist_yaw2_orientation_deg': res.get('wrist_yaw2_orientation_deg'),
+                'wrist_yaw2_position_deg': res.get('wrist_yaw2_position_deg'),
+                'perp_dist_before': float('nan'),
+                'perp_dist_after': float('nan'),
+                'axial_offset_mm': float('nan'),
+                'lateral_offset_mm': float('nan'),
+                'r_A': res['r_A'],
+                'r_B': res['r_B'],
+                'first_res': res,
+                'final_res': res,
+            }
         finally:
             logger.save()
 
@@ -350,8 +681,8 @@ class JointCalibrator(BaseCalibrator):
             pts_b = np.array(pts_b)
             
             # 3D fit circles
-            c_A, R_c_A, r_A, rmse_A, pts_2d_A, uc_A, vc_A = BaseCalibrator.fit_circle_3d(pts_a, robust=not self.is_mock)
-            c_B, R_c_B, r_B, rmse_B, pts_2d_B, uc_B, vc_B = BaseCalibrator.fit_circle_3d(pts_b, robust=not self.is_mock)
+            c_A, R_c_A, r_A, rmse_A, pts_2d_A, uc_A, vc_A = BaseCalibrator.fit_circle_3d(pts_a, robust=True)
+            c_B, R_c_B, r_B, rmse_B, pts_2d_B, uc_B, vc_B = BaseCalibrator.fit_circle_3d(pts_b, robust=True)
             
             n_A = R_c_A[:, 2]
             n_B = R_c_B[:, 2]
@@ -448,11 +779,11 @@ class JointCalibrator(BaseCalibrator):
             )
             plt.tight_layout()
             
-            from core.paths import CONFIG_PATHS
+            from core.storage import CONFIG_PATHS
             result_dir = CONFIG_PATHS["plot_dir"]
-            os.makedirs(result_dir, exist_ok=True)
+            FileStorage.ensure_dir(result_dir, exist_ok=True)
             plot_save_path = os.path.abspath(os.path.join(result_dir, f"debug_orthogonal_circles_{arm_side}_{frame}.png"))
-            plt.savefig(plot_save_path, dpi=150)
+            ArtifactStorage.save_figure(plot_save_path, dpi=150)
             plt.close()
             if log_callback:
                 log_callback(f"[SUCCESS] Orthogonal debug plot saved to: {plot_save_path}")
@@ -469,9 +800,29 @@ class JointCalibrator(BaseCalibrator):
 
             fig, axes = plt.subplots(2, 2, figsize=(14, 12))
 
+            def extract_plot_dict(res_obj, default_stage="first"):
+                if not res_obj or not isinstance(res_obj, dict):
+                    return {}
+                if '_plot_data' in res_obj:
+                    return res_obj
+                if default_stage == "first":
+                    if 'first_res' in res_obj and isinstance(res_obj['first_res'], dict):
+                        return extract_plot_dict(res_obj['first_res'], "first")
+                    if 'final_res' in res_obj and isinstance(res_obj['final_res'], dict):
+                        return extract_plot_dict(res_obj['final_res'], "final")
+                else:
+                    if 'final_res' in res_obj and isinstance(res_obj['final_res'], dict):
+                        return extract_plot_dict(res_obj['final_res'], "final")
+                    if 'first_res' in res_obj and isinstance(res_obj['first_res'], dict):
+                        return extract_plot_dict(res_obj['first_res'], "first")
+                return res_obj
+
+            first_res_actual = extract_plot_dict(first_res, "first")
+            final_res_actual = extract_plot_dict(final_res, "final")
+
             def plot_column(res, col_idx, stage_name):
                 # Read from internal _plot_data bundle
-                pd = res.get('_plot_data', {})
+                pd = res.get('_plot_data', res)
                 pts_a      = pd.get('pts_a_cam')
                 pts_b      = pd.get('pts_b_cam')
                 c_A        = pd.get('c_A')
@@ -574,14 +925,14 @@ class JointCalibrator(BaseCalibrator):
                 except Exception:
                     pass
 
-            plot_column(first_res, 0, "BEFORE")
-            plot_column(final_res, 1, "AFTER")
+            plot_column(first_res_actual, 0, "BEFORE")
+            plot_column(final_res_actual, 1, "AFTER")
 
             before_dist_str = ""
             after_dist_str = ""
             if mode == "wrist_pitch_v13":
-                first_pd = first_res.get('_plot_data', {})
-                final_pd = final_res.get('_plot_data', {})
+                first_pd = first_res_actual.get('_plot_data', first_res_actual)
+                final_pd = final_res_actual.get('_plot_data', final_res_actual)
                 if all(k in first_pd for k in ('c_A', 'n_A', 'c_B', 'n_B')):
                     dist_before = compute_shortest_distance_between_lines(
                         first_pd['c_A'], first_pd['n_A'], first_pd['c_B'], first_pd['n_B']
@@ -595,8 +946,8 @@ class JointCalibrator(BaseCalibrator):
                     if nominal_dist_35 is not None:
                         after_dist_str += f" (Nom: {nominal_dist_35:.2f} mm)"
 
-            first_pd = first_res.get('_plot_data', first_res)
-            final_pd = final_res.get('_plot_data', final_res)
+            first_pd = first_res_actual.get('_plot_data', first_res_actual)
+            final_pd = final_res_actual.get('_plot_data', final_res_actual)
             fig.suptitle(
                 f"Joint Calibration: {arm_side.upper()} Arm - {mode.upper()}\n"
                 f"Before: Angle Dev = {first_pd.get('angle_between_normals', 0.0):.3f}°, Center Dist = {first_pd.get('center_dist', 0.0):.2f} mm{before_dist_str}\n"
@@ -605,16 +956,16 @@ class JointCalibrator(BaseCalibrator):
             )
             plt.tight_layout()
 
-            from core.paths import CONFIG_PATHS
+            from core.storage import CONFIG_PATHS
             result_dir = CONFIG_PATHS["plot_dir"]
-            os.makedirs(result_dir, exist_ok=True)
+            FileStorage.ensure_dir(result_dir, exist_ok=True)
             plot_save_path = os.path.abspath(os.path.join(result_dir, f"circle_fit_{arm_side}_{mode}_joint_calib.png"))
             if not force_overwrite and os.path.exists(plot_save_path):
                 plt.close()
                 if log_callback:
                     log_callback(f"[INFO] Comparison plot already exists at: {plot_save_path}, skipping overwrite.")
             else:
-                plt.savefig(plot_save_path, dpi=150)
+                ArtifactStorage.save_figure(plot_save_path, dpi=150)
                 plt.close()
                 if log_callback:
                     log_callback(f"[SUCCESS] Saved combined calibration comparison plot to: {plot_save_path}")
@@ -627,7 +978,12 @@ class JointCalibrator(BaseCalibrator):
                 log_callback(traceback.format_exc())
             return None
 
-    def perform_calibration_sweep_continuous(self, arm_side, mode, log_callback=None, status_callback=None, current_offset_deg=0.0, sweep_duration=12.0, use_angle_based_fitting=None, save_debug=False, first_starting_pose=None):
+    def perform_calibration_sweep_continuous(self, arm_side, mode, log_callback=None, status_callback=None, current_offset_deg=0.0, sweep_duration=None, use_angle_based_fitting=None, save_debug=False, first_starting_pose=None, skip_visibility_check=False, debug_points_note=None):
+        """debug_points_note: when given, the raw sweep points are saved with this line even if
+        save_debug (plot and points) is off for this sweep."""
+        if sweep_duration is None:
+            sweep_duration = JOINT_SWEEP_DURATION_BY_MODE_S.get(mode, JOINT_SWEEP_DURATION_S)
+        self.current_calib_mode = mode
         if getattr(self, 'stop_requested', False):
             return None
 
@@ -641,9 +997,9 @@ class JointCalibrator(BaseCalibrator):
                 log_callback(f"   [Baseline Shift (Current Applied Offset): {current_offset_deg:.4f}°]")
             log_callback("="*50)
 
-        is_camera_mock = (self.marker_st is None or type(self.marker_st).__name__ == "SimulatedMarkerTransform")
-
-        if not is_camera_mock:
+        if skip_visibility_check:
+            if status_callback: status_callback(True)
+        elif not getattr(self.marker_st, 'sim', False):
             # Pre-check marker visibility after settling delay
             time.sleep(1.0)
             initial_check = self.marker_st.get_marker_transform(sampling_time=2.0, side=arm_side)
@@ -651,7 +1007,10 @@ class JointCalibrator(BaseCalibrator):
                 if log_callback: log_callback("[ERROR] Marker is not visible.")
                 if hasattr(self, 'marker_problem_callback') and self.marker_problem_callback:
                     if log_callback: log_callback("[INFO] Prompting user for manual teaching due to marker visibility error...")
-                    resolved = self.marker_problem_callback(arm_side)
+                    # Back to the ready pose before asking: the arm may still be where the
+                    # previous sweep ended, not where this sweep starts from.
+                    self.perform_move_to_ready_pose(arm_side, mode=mode, log_callback=log_callback)
+                    resolved = self.marker_problem_callback(arm_side, mode=mode)
                     if resolved:
                         self.perform_move_to_ready_pose(arm_side, mode=mode, log_callback=log_callback)
                         time.sleep(1.0)
@@ -663,7 +1022,8 @@ class JointCalibrator(BaseCalibrator):
         else:
             if status_callback: status_callback(True)
 
-        if getattr(self, 'stop_requested', False):
+        if not self.robot:
+            if log_callback: log_callback("[ERROR] Robot is not connected.")
             return None
 
         state = self.robot.get_state()
@@ -672,7 +1032,7 @@ class JointCalibrator(BaseCalibrator):
         if first_starting_pose is not None:
             initial_joint_pos = list(first_starting_pose)
         else:
-            initial_joint_pos = list(state.position[arm_idx])
+            initial_joint_pos = list(np.array(state.position)[arm_idx])
 
         # Define joint parameters from JOINT_CONFIGS
         jcfg = self.JOINT_CONFIGS[mode]
@@ -743,19 +1103,21 @@ class JointCalibrator(BaseCalibrator):
             return None
 
         # Save FULL captured continuous sweep points to debug txt files before downsampling
-        if save_debug:
+        if save_debug or debug_points_note is not None:
             self.save_debug_points(
-                arm_side, sweep_joint_A, dataset_A, initial_joint_pos, ee_name, dyn_model, None, "joint_A", log_callback
+                arm_side, sweep_joint_A, dataset_A, initial_joint_pos, ee_name, dyn_model, None, "joint_A", log_callback,
+                note=debug_points_note, file_tag=self.sweep_points_tag(mode, "joint_A")
             )
             self.save_debug_points(
-                arm_side, sweep_joint_B, dataset_B, initial_joint_pos, ee_name, dyn_model, None, "joint_B", log_callback
+                arm_side, sweep_joint_B, dataset_B, initial_joint_pos, ee_name, dyn_model, None, "joint_B", log_callback,
+                note=debug_points_note, file_tag=self.sweep_points_tag(mode, "joint_B")
             )
         
-        # Keep up to 200 points for speed and accuracy
+        # Fit all captured frames (cap only as a runtime guard)
         raw_len_A = len(dataset_A)
         raw_len_B = len(dataset_B)
-        
-        max_pts = 200
+
+        max_pts = MAX_FIT_POINTS
         if len(dataset_A) > max_pts:
             indices_A = np.round(np.linspace(0, len(dataset_A) - 1, max_pts)).astype(int)
             dataset_A = [dataset_A[idx] for idx in indices_A]
@@ -781,6 +1143,73 @@ class JointCalibrator(BaseCalibrator):
             sweep_joint_B=sweep_joint_B
         )
 
+    def wrist_yaw2_offset_from_positions(self, arm_side, dataset_A, n6, n5, c6, arm_idx, dyn_model,
+                                         log_callback=None, edge_deg=(0.5, 1.0, 2.0), min_frames=8):
+        """v1.2 J6 offset from marker positions only (see WRIST_YAW2_METHOD).
+
+        During the J6 sweep the marker circles the J6 axis (n6, through c6); the J5 axis n5 is
+        fixed. For a frame, the angle about n6 from the J5 axis to the marker's radial offset is
+        compared with the same angle from the URDF at that frame's encoder angles and the current
+        bracket; the difference is how far J6 physically sits from its encoder reading. Only frames
+        near the two ends of the sweep are used, where the joint is slow, so the camera latency
+        (~65 ms) does not skew the encoder pairing: in a synthetic smooth-profile sweep with 65 ms
+        of latency the bias was +0.08 deg using the last 2 deg of each end and +0.02 deg using
+        0.5 deg. The window widens (edge_deg) until min_frames frames are in it.
+        n6/n5 must already point like the URDF axes.
+        Returns the offset in degrees (same convention as the other methods), or None.
+        """
+        if not dataset_A or n6 is None or n5 is None or c6 is None:
+            return None
+        n6 = np.asarray(n6, dtype=float) / np.linalg.norm(n6)
+        n5 = np.asarray(n5, dtype=float) / np.linalg.norm(n5)
+
+        def angle_about(axis, ref, vec):
+            vec = vec - np.dot(vec, axis) * axis
+            ref = ref - np.dot(ref, axis) * axis
+            if np.linalg.norm(vec) < 1e-9 or np.linalg.norm(ref) < 1e-9:
+                return None
+            vec, ref = vec / np.linalg.norm(vec), ref / np.linalg.norm(ref)
+            return float(np.arctan2(np.dot(axis, np.cross(ref, vec)), np.dot(ref, vec)))
+
+        j6 = np.array([q[arm_idx[6]] for q, _ in dataset_A], dtype=float)
+        near_ends = np.ones(len(dataset_A), dtype=bool)
+        for edge in edge_deg:
+            window = (j6 <= j6.min() + np.radians(edge)) | (j6 >= j6.max() - np.radians(edge))
+            if window.sum() >= min_frames:
+                near_ends = window
+                break
+
+        tf_vec = self.camera_config.get(f"Tf_to_marker_{arm_side}")
+        if tf_vec is None:
+            tf_vec = self.camera_config.get(f"Tf_to_marker_{arm_side}_v12")
+        if tf_vec is None:
+            return None
+        T_ee_m = self.make_transform(tf_vec)
+        diffs = []
+        for (q_full, pose), use in zip(dataset_A, near_ends):
+            if not use:
+                continue
+            psi_meas = angle_about(n6, n5, np.asarray(pose)[:3, 3] * 1000.0 - c6)
+            T5 = self.compute_fk(self.robot, dyn_model, q_full, f"link_{arm_side}_arm_5")
+            T4 = self.compute_fk(self.robot, dyn_model, q_full, f"link_{arm_side}_arm_4")
+            T6 = self.compute_fk(self.robot, dyn_model, q_full, f"link_{arm_side}_arm_6")
+            T_ee = self.compute_fk(self.robot, dyn_model, q_full, f"ee_{arm_side}")
+            a6 = T5[:3, :3] @ np.array([0.0, 0.0, 1.0])
+            a5 = T4[:3, :3] @ np.array([0.0, 1.0, 0.0])
+            p_marker = (T_ee @ T_ee_m)[:3, 3] * 1000.0
+            psi_nom = angle_about(a6 / np.linalg.norm(a6), a5, p_marker - T6[:3, 3] * 1000.0)
+            if psi_meas is None or psi_nom is None:
+                continue
+            diffs.append((psi_meas - psi_nom + np.pi) % (2 * np.pi) - np.pi)
+        if len(diffs) < 3:
+            return None
+        diffs = np.degrees(np.array(diffs))
+        offset = -float(np.median(diffs))
+        if log_callback:
+            log_callback(f"  * Position-based J6: {len(diffs)} frames near the sweep ends, "
+                         f"spread {np.std(diffs):.3f}° -> offset {offset:+.4f}°")
+        return offset
+
     def compute_calibration_results(self, arm_side, mode, dataset_A, dataset_B, initial_joint_pos, current_offset_deg=0.0, use_angle_based_fitting=None, save_debug=False, log_callback=None, cand_joint=None, sweep_joint_A=None, sweep_joint_B=None):
         if use_angle_based_fitting is None:
             use_angle_based_fitting = getattr(self, 'use_angle_based_fitting', True)
@@ -792,8 +1221,8 @@ class JointCalibrator(BaseCalibrator):
             a_B_local = np.array([0.0, 1.0, 0.0])
         elif mode == "wrist_pitch_v13":
             a_cand_local = np.array([0.0, 1.0, 0.0])
-            a_A_local = np.array([0.0, 1.0, 0.0])
-            a_B_local = np.array([0.0, 1.0, 0.0])
+            a_A_local = np.array([1.0, 0.0, 0.0])
+            a_B_local = np.array([0.0, 0.0, 1.0])
         elif mode in ("wrist_pitch", "elbow"):
             a_cand_local = np.array([0.0, 1.0, 0.0])
             a_A_local = np.array([0.0, 0.0, 1.0])
@@ -812,7 +1241,7 @@ class JointCalibrator(BaseCalibrator):
         sweep_joint_B = jcfg["sweep_joint_B"]
 
         if not self.robot:
-            raise RuntimeError("Robot instance is not initialized")
+            raise RuntimeError("Robot instance is not initialized or connected.")
             
         state = self.robot.get_state()
         model = self.robot.model()
@@ -845,14 +1274,30 @@ class JointCalibrator(BaseCalibrator):
         logging.debug(f"       a_A_t5    = {a_A_t5.tolist()}")
         logging.debug(f"       a_B_t5    = {a_B_t5.tolist()}")
 
-        # Use nominal fixed camera rotation relative to torso (ZYX [-90, 0, -90])
-        # to avoid using uncalibrated mount_to_cam values or head kinematics.
-        R_rob_to_cam = R_scipy.from_euler('ZYX', [-90.0, 0.0, -90.0], degrees=True).as_matrix()
+        # Calculate accurate transformation from torso to camera frame
+        if self.is_head_active():
+            mount_to_cam = self.camera_config.get("mount_to_cam", [0.047, 0.009, 0.057, -90.0, 0.0, -90.0])
+            T_mount_to_cam = self.make_transform(mount_to_cam)
+            q_init = dataset_A[0][0]
+            T_t5_to_head = self.compute_fk(self.robot, dyn_model, q_init, "link_head_2", "link_torso_5")
+            T_t5_to_cam = T_t5_to_head @ T_mount_to_cam
+        else:
+            head_base_to_cam = self.camera_config.get("head_base_to_cam", [0.098, 0.009, 0.012, -90.0, 0.0, -90.0])
+            T_head_base_to_cam = self.make_transform(head_base_to_cam)
+            q_init = dataset_A[0][0]
+            try:
+                T_t5_to_head_0 = self.compute_fk(self.robot, dyn_model, q_init, "link_head_0", "link_torso_5")
+            except Exception:
+                T_t5_to_head_0 = np.eye(4)
+            T_t5_to_cam = T_t5_to_head_0 @ T_head_base_to_cam
 
-        # Define nominal axes in the camera frame using transpose of R_rob_to_cam (since R_rob_to_cam is R_cam_to_torso)
-        a_cand_cam = R_rob_to_cam.T @ a_cand_t5
-        a_A_cam = R_rob_to_cam.T @ a_A_t5
-        a_B_cam_nom = R_rob_to_cam.T @ a_B_t5
+        T_torso_to_cam = np.linalg.inv(T_t5_to_cam)
+        R_torso_to_cam = T_torso_to_cam[:3, :3]
+
+        # Define nominal axes in the camera frame
+        a_cand_cam = R_torso_to_cam @ a_cand_t5
+        a_A_cam = R_torso_to_cam @ a_A_t5
+        a_B_cam_nom = R_torso_to_cam @ a_B_t5
 
         a_cand_cam /= np.linalg.norm(a_cand_cam)
         a_A_cam /= np.linalg.norm(a_A_cam)
@@ -865,13 +1310,13 @@ class JointCalibrator(BaseCalibrator):
         angles_B = [np.degrees(q_full[arm_idx[sweep_joint_B]] - initial_joint_pos[sweep_joint_B]) for q_full, _ in dataset_B]
 
         # 3. Fit Sweep A and B axes in the camera frame
-        robust_fit = not self.is_mock
+        robust_fit = True
         res_A = BaseCalibrator.fit_circle_3d_and_6dof_misalignment(poses_A, angles_A, axis_prior=a_A_cam, robust=robust_fit)
         res_B = BaseCalibrator.fit_circle_3d_and_6dof_misalignment(poses_B, angles_B, axis_prior=a_B_cam_nom, robust=robust_fit)
 
         n_A = res_A['axis_opt']
         n_B = res_B['axis_opt']
-        if np.dot(n_A, n_B) < 0:
+        if mode not in ("wrist_roll_v13", "wrist_pitch_v13") and np.dot(n_A, n_B) < 0:
             n_B = -n_B
 
         r_A = res_A['radius']
@@ -894,62 +1339,9 @@ class JointCalibrator(BaseCalibrator):
         n_B = n_B if np.dot(n_B, a_B_cam_nom) > 0 else -n_B
 
         # Project nominal and actual axes onto the plane perpendicular to the candidate joint axis
-        if mode == "wrist_pitch_v13":
-            try:
-                # Phase-based fitting for parallel axes (J5 vs J3)
-                mount_to_cam = self.camera_config.get("mount_to_cam", [0.047, 0.009, 0.057, -90.0, 0.0, -90.0])
-                T_mount_to_cam = self.make_transform(mount_to_cam)
-                
-                q_first, T_cam_to_marker_first = dataset_A[0]
-                T_t5_to_head = self.compute_fk(self.robot, dyn_model, q_first, "link_head_2", "link_torso_5")
-                T_t5_to_cam = T_t5_to_head @ T_mount_to_cam
-                T_torso_to_cam = np.linalg.inv(T_t5_to_cam)
-                
-                ver_key = "v1.3" if self.is_v13() else "v1.2"
-                key = f"Tf_to_marker_{arm_side}"
-                if self.camera_config and key in self.camera_config:
-                    bracket_vec = self.camera_config[key]
-                else:
-                    bracket_vec = self.NOMINAL_BRACKET_TEMPLATES[ver_key][arm_side]
-                T_ee_to_marker = self.make_transform(bracket_vec)
-                
-                arm_idx = self.robot.model().left_arm_idx if arm_side == "left" else self.robot.model().right_arm_idx
-                
-                angles = []
-                for q_full, T_cam_to_marker in dataset_A:
-                    q_nom = np.array(q_full)
-                    if hasattr(self, 'joint_offsets') and self.joint_offsets:
-                        offsets = self.joint_offsets[arm_side] if arm_side in self.joint_offsets else self.joint_offsets
-                        q_nom[arm_idx[3]] -= np.radians(offsets.get("elbow", 0.0))
-                        q_nom[arm_idx[5]] -= np.radians(offsets.get("wrist_pitch", 0.0))
-                        q_nom[arm_idx[6]] -= np.radians(offsets.get("wrist_roll", 0.0))
-                    
-                    T_torso_to_ee_nom = self.compute_fk(self.robot, dyn_model, q_nom, ee_name, "link_torso_5")
-                    T_cam_to_marker_nom = T_torso_to_cam @ T_torso_to_ee_nom @ T_ee_to_marker
-                    p_nom = T_cam_to_marker_nom[:3, 3]
-                    p_meas = T_cam_to_marker[:3, 3]
-                    
-                    v_nom = p_nom - c_A_c / 1000.0
-                    v_nom = v_nom - np.dot(v_nom, n_A) * n_A
-                    v_nom /= np.linalg.norm(v_nom)
-                    
-                    v_meas = p_meas - c_A_c / 1000.0
-                    v_meas = v_meas - np.dot(v_meas, n_A) * n_A
-                    v_meas /= np.linalg.norm(v_meas)
-                    
-                    ang = np.arctan2(np.dot(np.cross(v_nom, v_meas), n_A), np.dot(v_nom, v_meas))
-                    angles.append(ang)
-                    
-                # We return negative of the mean to represent the compensation offset
-                optimal_offset_deg = float(np.degrees(np.mean(angles)))
-            except Exception as e:
-                import traceback
-                if log_callback:
-                    log_callback(f"[WARN] Phase-based fitting failed: {e}\n{traceback.format_exc()}. Using 0.0.")
-                optimal_offset_deg = 0.0
-            
-            diff_angle = np.radians(optimal_offset_deg)
-        elif mode in ("wrist_roll_v13", "wrist_yaw2"):
+        estimate_failed = False
+        wrist_yaw2_orientation_deg = wrist_yaw2_position_deg = None
+        if mode in ("wrist_roll_v13", "wrist_yaw2"):
             try:
                 from core.calibration.MarkerCalibrator import MarkerCalibrator
                 mc = MarkerCalibrator(self.marker_st, self.robot)
@@ -1006,7 +1398,9 @@ class JointCalibrator(BaseCalibrator):
                         staged_j7_offset_deg = offsets.get("wrist_roll" if self.is_v13() else "wrist_yaw2", 0.0)
                     
                     j7_ready_pose_deg = j7_current_pos_deg - staged_j7_offset_deg
-                    damping_factor = 0.8
+                    # 2026-09-15: 0.8 -> 1.0. Real runs show raw gain ~1.0 and the outer loop
+                    # now averages repeated estimates, so under-stepping only cost iterations.
+                    damping_factor = 1.0
                     optimal_offset_deg = (raw_diff_deg * damping_factor) + j7_current_pos_deg
                     
                     if log_callback:
@@ -1017,7 +1411,39 @@ class JointCalibrator(BaseCalibrator):
                     log_callback(f"[WARN] MarkerCalibrator fallback failed: {e}\n{traceback.format_exc()}. Using 0.0.")
                 optimal_offset_deg = 0.0
                 diff_angle = 0.0
+                estimate_failed = True
+            if mode == "wrist_yaw2" and not estimate_failed:
+                # Both J6 estimates are always computed and reported; WRIST_YAW2_METHOD picks the one
+                # used (2026-09-29: on the D405 the orientation method missed the baseline by
+                # +0.43 / -0.85 deg while the position method stayed within 0.1-0.2 deg).
+                wrist_yaw2_orientation_deg = float(optimal_offset_deg)
+                wrist_yaw2_position_deg = self.wrist_yaw2_offset_from_positions(
+                    arm_side, dataset_A, n_A, n_B, c_A_c, arm_idx, dyn_model, log_callback=log_callback)
+                optimal_offset_deg, j6_disagreement = choose_wrist_yaw2_offset(
+                    wrist_yaw2_orientation_deg, wrist_yaw2_position_deg, WRIST_YAW2_METHOD)
+                if log_callback:
+                    if wrist_yaw2_position_deg is None:
+                        log_callback(f"[WARN] wrist_yaw2: position-based J6 could not be computed; "
+                                     f"using the orientation method ({wrist_yaw2_orientation_deg:+.3f}°).")
+                    else:
+                        log_callback(f"[INFO] wrist_yaw2 J6 estimates: orientation {wrist_yaw2_orientation_deg:+.3f}°, "
+                                     f"position {wrist_yaw2_position_deg:+.3f}° (difference {j6_disagreement:+.3f}°); "
+                                     f"using the {WRIST_YAW2_METHOD} method.")
+                        if abs(j6_disagreement) > WRIST_YAW2_METHOD_DISAGREE_WARN_DEG:
+                            log_callback(f"[WARN] wrist_yaw2: the two J6 estimates differ by {abs(j6_disagreement):.2f}° "
+                                         f"(> {WRIST_YAW2_METHOD_DISAGREE_WARN_DEG}°). The orientation method follows the "
+                                         f"marker-orientation measurement, the position method the bracket's lateral "
+                                         f"mounting; check both before trusting J6.")
         else:
+            # wrist_pitch_v13 (J5) falls through to here too, same as v1.2's wrist_pitch and
+            # elbow -- only the JOINT_CONFIGS axis assignment (cand_joint/sweep_joint_A/B) and
+            # nominal local axis vectors differ per mode/version, not the computation method.
+            # Unlike elbow/wrist_pitch (whose A/B sweep axes are nominally concentric, so their
+            # own center-distance method below overrides this with a vibration-robust
+            # measurement), wrist_pitch_v13's A/B axes (joints 6 and 4) are nominally
+            # *orthogonal*, not concentric -- the center-distance method's parallel-axis
+            # assumption doesn't hold, so this signed projected-angle deviation IS the final
+            # optimal_offset_deg for wrist_pitch_v13 (see the final `elif` below).
             # Project axes onto the candidate joint's rotation plane to absorb physical DH twist errors
             # This ensures smooth zero-crossing even if the sweep axes are not perfectly parallel.
             a_A_proj = a_A_cam - np.dot(a_A_cam, a_cand_cam) * a_cand_cam
@@ -1048,11 +1474,23 @@ class JointCalibrator(BaseCalibrator):
                 # Robust Center-Distance Method for parallel joints
                 # The normal vector of a small arc is highly sensitive to vibrations.
                 # However, the distance between the rotation centers is extremely robust and proportional to the angle error.
-                mount_to_cam = self.camera_config.get("mount_to_cam", [0.047, 0.009, 0.057, -90.0, 0.0, -90.0])
-                T_mount_to_cam = self.make_transform(mount_to_cam)
-                q_init = dataset_A[0][0]
-                T_t5_to_head = self.compute_fk(self.robot, dyn_model, q_init, "link_head_2", "link_torso_5")
-                T_torso_to_cam = np.linalg.inv(T_t5_to_head @ T_mount_to_cam)
+                if self.is_head_active():
+                    mount_to_cam = self.camera_config.get("mount_to_cam", [0.047, 0.009, 0.057, -90.0, 0.0, -90.0])
+                    T_mount_to_cam = self.make_transform(mount_to_cam)
+                    q_init = dataset_A[0][0]
+                    T_t5_to_head = self.compute_fk(self.robot, dyn_model, q_init, "link_head_2", "link_torso_5")
+                    T_t5_to_cam = T_t5_to_head @ T_mount_to_cam
+                else:
+                    head_base_to_cam = self.camera_config.get("head_base_to_cam", [0.098, 0.009, 0.012, -90.0, 0.0, -90.0])
+                    T_head_base_to_cam = self.make_transform(head_base_to_cam)
+                    q_init = dataset_A[0][0]
+                    try:
+                        T_t5_to_head_0 = self.compute_fk(self.robot, dyn_model, q_init, "link_head_0", "link_torso_5")
+                    except Exception:
+                        T_t5_to_head_0 = np.eye(4)
+                    T_t5_to_cam = T_t5_to_head_0 @ T_head_base_to_cam
+
+                T_torso_to_cam = np.linalg.inv(T_t5_to_cam)
                 
                 arm_side_str = "left" if arm_side == "left" else "right"
                 
@@ -1067,13 +1505,20 @@ class JointCalibrator(BaseCalibrator):
                 T_cand_child = self.compute_fk(self.robot, dyn_model, q_init, f"link_{arm_side_str}_arm_{cand_joint}")
                 p_cand_cam = (T_torso_to_cam @ T_cand_child)[:3, 3] * 1000.0  # mm
                 
-                vec_elbow_to_cA = c_A_c - p_cand_cam
+                # Project centers to candidate plane
+                c_A_proj = c_A_c - np.dot(c_A_c - p_cand_cam, true_a_cand_cam) * true_a_cand_cam
+                c_B_proj = c_B_c - np.dot(c_B_c - p_cand_cam, true_a_cand_cam) * true_a_cand_cam
                 
-                # Cross direction gives the expected displacement direction for a positive physical offset
-                dir_vec = np.cross(true_a_cand_cam, vec_elbow_to_cA)
-                L2 = np.sum(dir_vec**2)
+                v_A = c_A_proj - p_cand_cam
+                v_B = c_B_proj - p_cand_cam
+                L1 = np.linalg.norm(v_A) # Length of link between cand joint and sweep joint A
+                L2 = np.linalg.norm(v_B) # Length of link between cand joint and sweep joint B
                 
-                if L2 > 1.0:
+                if L1 > 1e-3 and L2 > 1e-3:
+                    # Direction perpendicular to v_A in the rotation plane
+                    dir_vec = np.cross(true_a_cand_cam, v_A / L1)
+                    # Project center displacement onto this perpendicular direction
+                    diff_centers = c_B_proj - c_A_proj
                     proj = np.dot(diff_centers, dir_vec)
                     sin_theta = np.clip(proj / L2, -1.0, 1.0)
                     # We return the negative of the physical error as the compensation offset
@@ -1082,7 +1527,10 @@ class JointCalibrator(BaseCalibrator):
                     optimal_offset_deg = 0.0
                     
             elif mode not in ("wrist_roll_v13", "wrist_yaw2"):
-                optimal_offset_deg = -np.degrees(diff_angle)
+                # Empirically verified sign against the live v1.3 simulator (2026-09-15):
+                # the negated form drove staged_offset in the wrong direction, growing the
+                # residual monotonically each iteration instead of shrinking it.
+                optimal_offset_deg = np.degrees(diff_angle)
 
         if log_callback:
             log_callback("\n" + "="*50)
@@ -1112,6 +1560,11 @@ class JointCalibrator(BaseCalibrator):
             'optimal_offset': optimal_offset_deg,
             'recommended_joint_offset': optimal_offset_deg,
             'converged': False,
+            # True when the J6 estimate fell back to 0.0 (the value is not a measurement).
+            'estimate_failed': estimate_failed,
+            # v1.2 J6 only: both estimates, whichever WRIST_YAW2_METHOD used (None elsewhere).
+            'wrist_yaw2_orientation_deg': wrist_yaw2_orientation_deg,
+            'wrist_yaw2_position_deg': wrist_yaw2_position_deg,
             '_dataset_A': dataset_A,
             '_dataset_B': dataset_B,
             '_initial_joint_pos': initial_joint_pos,

@@ -1,3 +1,5 @@
+from .sequences.result import SequenceCancelled
+from core.storage import FileStorage, ArtifactStorage
 import cv2
 import numpy as np
 import os
@@ -43,7 +45,7 @@ class IntrinsicsCalibrator:
         self.aruco_dict = None
         self.charuco_board = None
         self.b_set_board = False
-        
+
         self.use_rational_model = False
         self.camera_matrix_guess = None
 
@@ -65,7 +67,7 @@ class IntrinsicsCalibrator:
         self.pattern = pattern
         self.square_size = square_size
         self.marker_size = marker_size
-        
+
         if pattern == self.BoardPattern.CHARUCOBOARD:
             # Map string dictionary name to cv2.aruco constants
             try:
@@ -74,7 +76,7 @@ class IntrinsicsCalibrator:
                 dict_attr = cv2.aruco.DICT_5X5_100
             self.aruco_dict = cv2.aruco.getPredefinedDictionary(dict_attr)
             self.charuco_board = cv2.aruco.CharucoBoard((width, height), square_size, marker_size, self.aruco_dict)
-        
+
         self.b_set_board = True
         return True
 
@@ -119,9 +121,9 @@ class IntrinsicsCalibrator:
         img_size = None
 
         for path in image_paths:
-            img = cv2.imread(path)
+            img = ArtifactStorage.read_image(path)
             if img is None: continue
-            
+
             if img_size is None:
                 img_size = (img.shape[1], img.shape[0])
 
@@ -131,7 +133,7 @@ class IntrinsicsCalibrator:
                 ret, corners = cv2.findChessboardCorners(gray, self.board_size, None)
                 if ret:
                     win_size = self._get_dynamic_win_size(corners, img_size)
-                    cv2.cornerSubPix(gray, corners, win_size, (-1, -1), 
+                    cv2.cornerSubPix(gray, corners, win_size, (-1, -1),
                                     (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
                     objp = np.zeros((self.board_size[0] * self.board_size[1], 3), np.float32)
                     objp[:, :2] = np.mgrid[0:self.board_size[0], 0:self.board_size[1]].T.reshape(-1, 2)
@@ -179,9 +181,12 @@ class IntrinsicsCalibrator:
         all_ids = []
         img_size = None
 
+        self.partial_data = {"object_points": all_obj_points, "image_points": all_img_points, "ids": all_ids}
         for i, img in enumerate(images):
+            if getattr(self, "stop_event", None) is not None and self.stop_event.is_set():
+                raise SequenceCancelled({"intrinsics": self.partial_data})
             if img is None: continue
-            
+
             if img_size is None:
                 img_size = (img.shape[1], img.shape[0])
 
@@ -190,7 +195,7 @@ class IntrinsicsCalibrator:
             if self.pattern == self.BoardPattern.CHESSBOARD:
                 ret, corners = cv2.findChessboardCorners(gray, self.board_size, None)
                 if ret:
-                    cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), 
+                    cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1),
                                     (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
                     objp = np.zeros((self.board_size[0] * self.board_size[1], 3), np.float32)
                     objp[:, :2] = np.mgrid[0:self.board_size[0], 0:self.board_size[1]].T.reshape(-1, 2)
@@ -331,33 +336,33 @@ class IntrinsicsCalibrator:
     def compute_cross_validation_rmse(self, all_obj_points, all_img_points, img_size, flags=0, mtx_init=None, dist_init=None):
         if len(all_obj_points) < 6:
             return None
-            
+
         # Determinisitic split: test set is every 4th frame (indices 3, 7, etc.)
         test_indices = list(range(3, len(all_obj_points), 4))
         train_indices = [i for i in range(len(all_obj_points)) if i not in test_indices]
-        
+
         train_obj = [all_obj_points[i] for i in train_indices]
         train_img = [all_img_points[i] for i in train_indices]
-        
+
         test_obj = [all_obj_points[i] for i in test_indices]
         test_img = [all_img_points[i] for i in test_indices]
-        
+
         # Calibrate on train set
         if mtx_init is None:
             mtx_init = np.eye(3, dtype=np.float64)
         else:
             mtx_init = mtx_init.copy()
-            
+
         if dist_init is None:
             dist_init = np.zeros((5, 1), dtype=np.float64)
         else:
             dist_init = dist_init.copy()
-            
+
         try:
             ret_t, mtx_t, dist_t, rvecs_t, tvecs_t = cv2.calibrateCamera(
                 train_obj, train_img, img_size, mtx_init, dist_init, flags=flags
             )
-            
+
             # Evaluate on test set
             test_errors = []
             for obj_pts, img_pts in zip(test_obj, test_img):
@@ -367,7 +372,7 @@ class IntrinsicsCalibrator:
                     proj_pts, _ = cv2.projectPoints(obj_pts, rvec, tvec, mtx_t, dist_t)
                     err = np.linalg.norm(img_pts - proj_pts, axis=2)
                     test_errors.extend(err.flatten())
-            
+
             if test_errors:
                 return float(np.sqrt(np.mean(np.array(test_errors)**2)))
         except Exception:
@@ -381,8 +386,7 @@ class IntrinsicsCalibrator:
             "camera_matrix": self.cameraMatrix.tolist(),
             "dist_coeffs": self.distCoeffs.flatten().tolist()
         }
-        with open(output_yaml, "w") as f:
-            yaml.dump(data, f, default_flow_style=False)
+        FileStorage.write_text(output_yaml, yaml.dump(data, default_flow_style=False))
         print(f"Results saved to {output_yaml} ({width}x{height})")
 
     def generate_verification_image(self, test_img, save_path):
@@ -391,12 +395,12 @@ class IntrinsicsCalibrator:
         """
         if test_img is None:
             return False
-            
+
         h, w = test_img.shape[:2]
-        
+
         new_mtx, _ = cv2.getOptimalNewCameraMatrix(self.cameraMatrix, self.distCoeffs, (w, h), 1, (w, h))
         undistorted = cv2.undistort(test_img, self.cameraMatrix, self.distCoeffs, None, new_mtx)
-        
+
         combined_res = np.vstack((test_img, undistorted))
         h_res, w_res = combined_res.shape[:2]
 
@@ -410,6 +414,6 @@ class IntrinsicsCalibrator:
         cv2.putText(combined_res, "Undistorted", (30, h + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
         cv2.putText(combined_res, f"RMS Error: {self.rms_error:.4f}", (30, h + 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 2)
 
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        cv2.imwrite(save_path, combined_res)
+        FileStorage.ensure_dir(os.path.dirname(save_path), exist_ok=True)
+        ArtifactStorage.save_image(save_path, combined_res)
         return True

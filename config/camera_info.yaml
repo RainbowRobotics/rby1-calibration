@@ -1,0 +1,36 @@
+# Per-camera-model bracket extrinsics (CAD nominal).
+#
+# Keys are the model FAMILY -- the bare body number, no variant suffix. A D435i and a D435f sit in
+# the same housing on the same bracket, so both resolve to the 'D435' entry here; do not add a
+# 'D435I' key. The matching intrinsics live in config/camera_intrinsics_<family lowercase>.yaml
+# (e.g. camera_intrinsics_d435.yaml).
+#
+# To support a new model: measure head_base_to_cam and mount_to_cam for its colour lens and add an
+# entry below. Until then the app starts with a warning and leaves setting.yaml untouched -- an
+# entry of placeholder zeros would be silently applied as if it were real, so do not add one.
+#
+# Format: [x, y, z (m), roll, pitch, yaw (deg)]
+#
+# mount_to_cam_position_range_m (optional, head-mounted camera only): for a bracket made to its
+# drawing. [low, high] in meters that the camera position may differ from mount_to_cam, per axis of
+# link_head_2 (x forward along the optical axis, y left, z up). With this key the camera angles are
+# held at mount_to_cam in Step 1.5 and Step 2, and Step 2 solves J6 itself instead of taking Step 1's
+# value. A camera that ends at an end of its range is reported in the log. Without the key the camera
+# position is estimated within +-25 mm as before.
+
+D405:
+  head_base_to_cam: [0.098, 0.009, 0.012, -90.0, 0.0, -90.0] # 42*42*23
+  # x: module face at 47 mm minus the 3.7 mm depth start point (the colour image comes from the same
+  # imager as the depth). y: half the 18 mm baseline. z: bracket height measured at the bolt position,
+  # 63 mm (2026-10-15; 67 mm until then was the height of the whole part). Range: only x is not
+  # settled (optical position inside the module), so z is held to +-0.5 mm.
+  mount_to_cam: [0.0433, 0.009, 0.063, -90.0, 0.0, -90.0]
+  mount_to_cam_position_range_m: [[-0.003, 0.001], [0.0, 0.0], [-0.0005, 0.0005]]
+  camera_mount_link: link_head_2
+  temp_supported: false
+
+D435: # covers D435, D435i and D435f
+  head_base_to_cam: [0.1045, -0.0115, 0.044, -90.0, 0.0, -90.0]
+  mount_to_cam: [0.0495, 0.0325, 0.067, -90.0, 0.0, -90.0]
+  camera_mount_link: link_head_2
+  temp_supported: false

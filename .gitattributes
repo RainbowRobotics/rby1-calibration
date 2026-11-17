@@ -1,0 +1,4 @@
+# Windows batch files must keep CRLF: with LF only, cmd.exe misreads lines that contain UTF-8
+# Korean text after `chcp 65001` and runs fragments such as `ker` instead of `docker` (2026-09-30).
+*.bat text eol=crlf
+*.cmd text eol=crlf

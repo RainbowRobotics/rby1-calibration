@@ -1,0 +1,22 @@
+# UI Dropdown and Form Options Configuration
+robot_models:
+  - "a"
+  - "m"
+
+arm_sides:
+  - "Right Arm"
+  - "Left Arm"
+
+marker_axes:
+  - "Axis 6 (Yaw Sweep, ±20°)"
+  - "Axis 5 (Pitch Sweep, ±10°)"
+
+joint_modes_v13:
+  - "wrist_roll_v13 (6-Axis Sweep)"
+  - "wrist_pitch_v13 (5-Axis Sweep)"
+  - "elbow (3-Axis Sweep)"
+
+joint_modes_v12:
+  - "wrist_yaw2 (6-Axis Sweep)"
+  - "wrist_pitch (5-Axis Sweep)"
+  - "elbow (3-Axis Sweep)"

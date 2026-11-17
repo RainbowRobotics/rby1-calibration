@@ -1,40 +1,43 @@
 camera:
-  Tf_to_marker_left: [0.00000, 0.05450, -0.05000, 90.12, 0.10, 0.00]
-  Tf_to_marker_left_v12: [0.0, 0.054, -0.048, 90.0, 0.0, 0.0]
-  Tf_to_marker_left_v13: [0.097, 0.0, -0.005, 90.0, 0.0, -90.0]
-  Tf_to_marker_right: [0.00000, -0.05390, -0.04600, 90.10, 0.10, 180.00]
-  Tf_to_marker_right_v12: [0.0, -0.054, -0.048, 90.0,0.0, 180.0]
-  Tf_to_marker_right_v13: [0.097, 0.0, -0.005, 90.0, 0.0, -90.0]
+  auto_exposure: true
   camera_mount_link: link_head_2
+  device_name: D405
   fps: 30
-  head_base_to_cam: [0.102, 0.009, 0.044, -90.0, 0.0, -90.0]
+  head_base_to_cam: [0.098, 0.009, 0.012, -90.0, 0.0, -90.0]
+  head_base_to_cam_nominal: [0.098, 0.009, 0.012, -90.0, 0.0, -90.0]
   height: 720
-  mount_to_cam: [0.047, 0.009, 0.057, -90.0, 0.0, -90.0] # [0.023, 0.0, 0.066,0.0,90.0,0.0]
+  mount_to_cam: [0.044299999999786475, 0.009006232409356796, 0.06349996115550234, -90.0, -0.7142000000000001, -90.0]
+  mount_to_cam_nominal: [0.0433, 0.009, 0.063, -90.0, 0.0, -90.0]
   width: 1280
-  optimize_camera: false
-  lambda_cam_pos: 1.0
-  lambda_cam_rot: 1.0
 joint_offset:
   left:
-    joint3: -0.6916334506336691
-    joint5: 2.981791528861338
-    joint6: -3.5372881010548953
+    joint3: 0.0
+    joint5: 0.0
+    joint6: 0.0
   right:
-    joint3: -0.4950912964511911
-    joint5: -5.4701545936882585
-    joint6: -2.387735530215594
-thermal_compensation:
-  enabled: false
-  baseline_temp: 32.0
-  focal_scale_per_deg: 0.00028
-  pp_x_shift_per_deg: 0.035
-  pp_y_shift_per_deg: -0.142
-
+    joint3: 0.0
+    joint5: 0.0
+    joint6: 0.0
+  head:
+    pan: 0.0
+    tilt: 0.0
 marker:
-
+  Tf_to_marker_left: [-6.6130927153957065e-18, 0.054, -0.048822789062607994, 90.0, -0.03370219571728235, 0.0]
+  Tf_to_marker_left_v12: [0.0, 0.054, -0.048, 90.0, 0.0, 0.0]
+  Tf_to_marker_left_v13: [0.067, 0.0, 0.0, 90.0, 0.0, -90.0]
+  Tf_to_marker_right: [6.6130927153957065e-18, -0.054, -0.048822789062607994, 90.0, -0.03370219571726962, 180.0]
+  Tf_to_marker_right_v12: [0.0, -0.054, -0.048, 90.0, 0.0, 180.0]
+  Tf_to_marker_right_v13: [0.067, 0.0, 0.0, 90.0, 0.0, -90.0]
   plate:
-    left_ids:
-    - 7
-    right_ids:
-    - 8
+    left_ids: [7]
     plate_size_mm: 80.0
+    right_ids: [8]
+step2:
+  min_marker_x_gap_m: 0.11
+  min_rot_noise_deg: 0.3
+  head_tilt_anchor_weight: 200000.0
+  sample_time_s: 1.0
+  skip_half_steps: true
+  wrist_diversity_poses: true
+exposure_check:
+  max_marker_jitter_rms_mm: 0.2

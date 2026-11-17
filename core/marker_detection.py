@@ -1,3 +1,6 @@
+from core.storage import camera_intrinsics_path, camera_intrinsics_serial_path
+from core.storage import ConfigStorage
+from core.camera_processing import RealSenseCamera, CameraUnavailableError
 import pyrealsense2 as rs
 import numpy as np
 import cv2
@@ -6,16 +9,25 @@ import struct
 import math
 import time
 import threading
-import os, yaml
+import sys
+import os
+import re
 
-#debugging flag : 실사용시 모두 false여야함
+#debugging flag : must be all false in production
 imshow_when_detect = False
 tcpip_send = False
-use_calib_int = False # 세밀하게 보정된 파일(camera_intrinsics.yaml)을 사용할지 여부
+# Which values from the calibrated intrinsics file (camera_intrinsics.yaml) override the factory ones:
+#   "off"             : factory fx, fy, cx, cy and distortion
+#   "principal_point" : calibrated cx, cy only (factory focal length and distortion kept)
+#   "full"            : calibrated fx, fy, cx, cy and distortion
+# The principal point sets where the optical axis is in the image, so it directly biases the head
+# tilt/pan pointing estimate (2026-09-15: factory cy 347.9 vs calibrated 350.6 px = 0.24 deg of tilt).
+calib_intrinsics_mode = "full"
 # see_depth_sensors_depth = False
 # see_stereo_depth = False
 
-# 유틸리티 클래스
+# Utility classes
+
 class TCPClient:
     def __init__(self, ip, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -49,371 +61,43 @@ class TCPClient:
             print(f"Send Error: {e}")
             self.connected = False
         
-# 카메라 클래스
+# Camera class
 """
-해당 클래스는 realsense 카메라만 호환
-다른 카메라를 사용할 경우 아래의 get이란 이름이 들어간 함수들의 양식을 동일하게 맞춰주고 구현하는것을 권장
+This class is only compatible with RealSense cameras
+If using another camera, it is recommended to implement functions with the same signature.
 """
-class RealSenseCamera:
-    # serial_number : 해당 넘버의 카메라를 사용, 입력하지 않으면 첫번째 카메라 사용
-    """카메라의 시리얼 넘버는 realsense_check.py를 통해 검색할 수 있음"""
-    def __init__(self, serial_number=None):
-        # 연결되어있는 카메라 검색
-        ctx = rs.context()
-        devices = ctx.query_devices()
-        if len(devices) == 0:
-            print("No RealSense devices found!")
-            raise RuntimeError("No RealSense connected")
-        # 카메라 선택 : 시리얼 넘버가 정해져있으면 해당 카메라 사용, 없으면 첫번째 카메라 사용
-        for i, dev in enumerate(devices):
-            print(f"[{i}] {dev.get_info(rs.camera_info.name)} (Serial: {dev.get_info(rs.camera_info.serial_number)})")
-            if serial_number == dev.get_info(rs.camera_info.serial_number) or serial_number is None:
-                self.device_number = i
-                break
-
-        # 안전한 사용을 위해 선택한 카메라 재연결
-        print("Resetting Realsense device...")
-        devices[self.device_number].hardware_reset()
-        # 카메라가 다시 연결될 때까지 대기
-        time.sleep(3)
-
-        # 카메라 정보 재확인(하드웨어 리셋했으므로 재확인 필요)
-        ctx = rs.context()
-        devices = ctx.query_devices()
-
-        self.device_name = devices[self.device_number].get_info(rs.camera_info.name)
-        self.serial_number = devices[self.device_number].get_info(rs.camera_info.serial_number)
-        print("Using camera is : ", self.device_name)
-
-        # depth 해상도 확인 : D435는 1mm, D405 는 0.1mm. 즉 모델에 따라 다름
-        depth_sensor = devices[self.device_number].first_depth_sensor()
-        if depth_sensor.supports(rs.option.thermal_compensation):
-            depth_sensor.set_option(rs.option.thermal_compensation, 1.0) # 온도보정기능 On
-            depth_sensor.set_option(rs.option.visual_preset, 3) # High Accuracy
-        depth_scale = depth_sensor.get_depth_scale()
-        print("depth scale : ", depth_scale)
-        
-
-        # 카메라 구동을 위한 파라미터 설정
-        self.depth_resolution = depth_scale*1000                # 각 픽셀의 depth 값 해상도
-        self.pipeline = rs.pipeline()                           # 카메라 스트리밍을 위한 파이프라인
-        self.config = rs.config()                               # 카메라 설정구조체
-        self.spatial = rs.spatial_filter()                      # 평활화 필터 (노이즈 제거)
-        self.spatial.set_option(rs.option.filter_magnitude, 2)  # 평활화 필터의 강도 설정
-        self.temporal = rs.temporal_filter()                    # 깜빡임 방지필터
-        self.hole_filling = rs.hole_filling_filter()            # 노이즈에 의한 빈 공간 채우는 필터
-
-        # 상태 flag
-        self.camera_running = False                             # 카메라 구동상태 flag
-        self.camera_monitoring = False                          # 카메라 모니터링 상태 flag
-        self.Infrared = True                                    # 적외선 카메라 사용 flag
-
-        #이미지 저장 변수
-        self.color_image = None
-        self.depth_image = None
-        # 기본해상도
-        self.width = 1280 # 848
-        self.height = 720 # 480
-        self.fps = 30
-
-        #카메라 내부 파라미터 : 해당 파라미터로 depth map 및 마커좌표 계산됨
-        self.fx = 0.0                                           # 초점거리 x
-        self.fy = 0.0                                           # 초점거리 y
-        self.principal_point = [0.0, 0.0]                       # 주점(이미지 중심)
-        self.intrinsics = None                                  # 내부 파라미터 행렬
-        self.profile = None                                     # 카메라 프로파일
-        self.baseline = 0.065                                   # 스테레오 카메라 베이스라인(m)
-        self.dist_coeffs = None                                 # 카메라 왜곡 계수
-
-        # 스레드 동기화를 위한 Lock
-        self.lock = threading.Lock()
-        self.thread = None
-
-    def initialize_camera(self, set_width, set_height, set_fps):
-        self.width = set_width
-        self.height = set_height
-        self.fps = set_fps
-        
-        try:
-            self.config.enable_device(self.serial_number)
-            # 사용할 카메라(컬러, depth, ir) 스트리밍 활성화. depth는 모든상황에 사용됨
-            # cpu 부하를 줄이기 위해 적외선 사용 시 ir1, ir2 를, 사용하지 않을 경우 color만 추가로 스트리밍 진행
-            self.config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
-            self.config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
-            if self.Infrared:
-                self.config.enable_stream(rs.stream.infrared, 1, self.width, self.height, rs.format.y8, self.fps)
-                self.config.enable_stream(rs.stream.infrared, 2, self.width, self.height, rs.format.y8, self.fps)
-            
-            # 파이프라인 시작
-            self.profile = self.pipeline.start(self.config)
-        except Exception as e:
-            print(f"Failed to start pipeline with {self.width}x{self.height}@{self.fps}. Error: {e}")
-            print("Attempting fallback resolution (848x480 @ 30fps)...")
-            try:
-                self.config = rs.config() # Reset config
-                self.config.enable_device(self.serial_number)
-                self.width, self.height, self.fps = 848, 480, 30
-                self.config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
-                self.config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
-                self.profile = self.pipeline.start(self.config)
-            except Exception as e2:
-                print(f"Fallback 1 failed: {e2}. Attempting 640x480 @ 30fps...")
-                try:
-                    self.config = rs.config()
-                    self.config.enable_device(self.serial_number)
-                    self.width, self.height, self.fps = 640, 480, 30
-                    self.config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
-                    self.config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
-                    self.profile = self.pipeline.start(self.config)
-                except Exception as e3:
-                    print(f"All profile attempts failed: {e3}")
-                    raise e3
-
-        try:
-            # 구동 후 카메라 안정화를 위해 10프레임 정도는 버리고 사용
-            for i in range(10):
-                self.pipeline.wait_for_frames()
-            
-            # [NEW] 센서 자동 노출(Auto Exposure) 설정 - 다양한 환경 대응
-            device = self.profile.get_device()
-            for sensor in device.query_sensors():
-                if sensor.supports(rs.option.enable_auto_exposure):
-                    sensor.set_option(rs.option.enable_auto_exposure, 1) # 자동 노출 활성화 (기존 수동 0)
-                # 기존 수동 설정 주석 처리
-                # if sensor.supports(rs.option.exposure):
-                #     try:
-                #         sensor.set_option(rs.option.exposure, 6000) # 6ms (모션 블러 방지와 밝기 밸런스)
-                #     except Exception as e:
-                #         print(f"Warning: Failed to set exposure on sensor {sensor.get_info(rs.camera_info.name)}: {e}")
-                # if sensor.supports(rs.option.gain):
-                #     try:
-                #         sensor.set_option(rs.option.gain, 80) # Gain 상향으로 밝기 확보
-                #     except Exception as e:
-                #         print(f"Warning: Failed to set gain on sensor {sensor.get_info(rs.camera_info.name)}: {e}")
-
-            # depth 카메라 내부 파라미터 얻기 : baseline, fx, fy, principal_point 를 위해 사용
-            color_stream = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
-
-            left_ir_stream = self.profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile()
-            right_ir_stream = self.profile.get_stream(rs.stream.infrared, 2).as_video_stream_profile()
-            
-            extrinsics = left_ir_stream.get_extrinsics_to(right_ir_stream)
-            self.baseline = abs(extrinsics.translation[0]) # m
-            self.intrinsics = color_stream.get_intrinsics()
-            self.fx = self.intrinsics.fx
-            self.fy = self.intrinsics.fy
-            self.principal_point = [self.intrinsics.ppx, self.intrinsics.ppy] #pixel
-            self.dist_coeffs = np.array(self.intrinsics.coeffs)
-
-            print(f"Successfully initialized: {self.width}x{self.height} @ {self.fps}fps")
-            print(f"Focal Length: fx={self.fx}, fy={self.fy}")
-            print(f"Principal Point: {self.principal_point[0]}, {self.principal_point[1]}")
-            print("Baseline: ", self.baseline)
-            self.camera_running = True
-        except Exception as e:
-            print(f"Camera didn't initialize post-start: {e}")
-            raise e
-
-    # Monitoring 함수로 스트리밍을 켜고 끔
-    def monitoring(self, Flag=True):
-        self.camera_monitoring = Flag
-        if self.camera_monitoring:
-            
-            self.thread = threading.Thread(target=self.stream_on)
-            self.thread.start()
-        else:
-            self.stream_off()
-            if self.thread is not None:
-                self.thread.join()
-
-    def stream_on(self , fps = 30):
-        align_to = rs.stream.color
-        align = rs.align(align_to)
-        frame_sleep = 1/fps
-        try:
-            while self.camera_running:
-                self.capture_image()
-                 # Visualization Logic
-                result_list = []
-                if self.color_image is not None:
-                    result_list.append(self.color_image)
-                if self.depth_image is not None:
-                    if np.max(self.depth_image) > 0:
-                        # min_dist = float(np.min(self.depth_image[self.depth_image > 0]))
-                        # max_dist = float(np.max(self.depth_image))
-                        min_dist = 700.0
-                        max_dist = 5000.0
-                        alpha = (0.0 - 255.0) / (max_dist - min_dist)
-                        beta = 255.0 - (min_dist * alpha)
-                    else:
-                        min_dist = 700.0
-                        max_dist = 5000.0
-                        alpha = (0.0 - 255.0) / (max_dist - min_dist)
-                        beta = 255.0 - (min_dist * alpha)
-                    depth_re_img = self.depth_image.astype(np.float32)
-                    depth_re_img = depth_re_img * alpha + beta
-                    depth_re_img = np.clip(depth_re_img, 0, 255).astype(np.uint8)
-                    # depth_re_img = depth_re_img.astype(np.uint8)
-                    depth_re_img[self.depth_image == 0] = 0
-                    depth_re_img_bgr = cv2.cvtColor(depth_re_img, cv2.COLOR_GRAY2BGR)
-                    #depth_re_img_bgr = cv2.applyColorMap(depth_re_img, cv2.COLORMAP_BONE)
-                    result_list.append(depth_re_img_bgr)
-                if self.Infrared == True and self.left_ir_image is not None and self.right_ir_image is not None:
-                    result_list.append(cv2.cvtColor(self.left_ir_image, cv2.COLOR_GRAY2BGR))
-                    result_list.append(cv2.cvtColor(self.right_ir_image, cv2.COLOR_GRAY2BGR))
-                
-                if len(result_list) > 0:
-                    if len(result_list) == 1:
-                        # 이미지가 한개일 때 화면 크기 기본 해상도의 1/2
-                        resize_height = self.height // 2
-                        resize_width = self.width // 2
-                    else:
-                        # 이미지가 두개 이상일 때 화면 크기 기본 해상도의 1/n
-                        resize_height = self.height // len(result_list)
-                        resize_width = (self.width // len(result_list)) * len(result_list)
-                    concat_image = cv2.hconcat(result_list)
-                    concat_image = cv2.resize(concat_image, (resize_width, resize_height))
-                    cv2.imshow("Preview", concat_image)
-                    key = cv2.waitKey(1)
-                    if key == 27 or key == ord('q'): # ESC or q
-                        raise KeyboardInterrupt
-                    
-                    if cv2.getWindowProperty('Preview', cv2.WND_PROP_VISIBLE) < 1:
-                        raise KeyboardInterrupt
-                time.sleep(frame_sleep)
-        except RuntimeError as e:
-            print(f"Error: {e}")
-
-    def stream_off(self):
-        self.camera_running = False
-        if self.thread is not None:
-            self.thread.join()
-        try:
-            self.pipeline.stop()
-        except:
-            pass
-
-    def capture_image(self):
-        # 복잡한 스레드 검사 로직(if self.thread is not None...)을 전부 삭제합니다.
-        if not self.camera_running:
-            return
-
-        # 이 함수는 stream_on(백그라운드 스레드)에서만 단독으로 실행됩니다.
-        try:
-            frames = self.pipeline.wait_for_frames()
-            
-            # [LEGACY] RealSense CPU Depth Align & Filter (마커 PnP 검출에는 미사용되나 프레임당 25ms 병목 발생 -> 주석 처리)
-            # align_to = rs.stream.color
-            # align = rs.align(align_to)
-            # aligned_frames = align.process(frames)
-            # color_frame = aligned_frames.get_color_frame()
-            # depth_frame = aligned_frames.get_depth_frame()
-            # depth_frame = self.spatial.process(depth_frame)
-            # depth_frame = self.temporal.process(depth_frame)
-            # depth_frame = self.hole_filling.process(depth_frame)
-
-            # [OPTIMIZED] Color 및 Depth 프레임 직접 취득 (CPU 병목 제거)
-            color_frame = frames.get_color_frame()
-            depth_frame = frames.get_depth_frame()
-            if not color_frame or not depth_frame:
-                print("no frame")
-                return
-            color_data = np.asanyarray(color_frame.get_data())
-            depth_data = np.asanyarray(depth_frame.get_data())
-        
-            with self.lock:
-                self.color_image = color_data
-                self.depth_image = depth_data
-                if self.Infrared:
-                    ir_frame_left = frames.get_infrared_frame(1)
-                    ir_frame_right = frames.get_infrared_frame(2)
-                    if ir_frame_left and ir_frame_right:
-                        self.left_ir_image = np.asanyarray(ir_frame_left.get_data())
-                        self.right_ir_image = np.asanyarray(ir_frame_right.get_data())
-        except Exception as e:
-            pass # 간헐적인 프레임 드랍 무시
-
-
-    # 연산을 위해 호출돼야하는 함수들
-    def get_color_image(self):
-        with self.lock:
-            if self.color_image is None:
-                return None
-            return self.color_image.copy()
-
-    def get_depth_image(self):
-        with self.lock:
-            if self.depth_image is None:
-                return None
-            return self.depth_image.copy()
-
-    def get_infrared_images(self):
-        with self.lock:
-            if not hasattr(self, 'left_ir_image') or not hasattr(self, 'right_ir_image'):
-                return None, None
-            return self.left_ir_image.copy(), self.right_ir_image.copy()
-
-    def get_principal_point_and_focal_length(self):
-        return [self.principal_point[0], self.principal_point[1], self.fx, self.fy]
-
-    def get_depth_resolution(self):
-        return self.depth_resolution
-
-    def get_baseline(self):
-        return self.baseline
-
-    def get_camera_temperature(self):
-        try:
-            if not self.camera_running or self.profile is None:
-                return None
-            device = self.profile.get_device()
-            depth_sensor = device.first_depth_sensor()
-            if depth_sensor.supports(rs.option.projector_temperature):
-                proj_temp = depth_sensor.get_option(rs.option.projector_temperature)
-                return proj_temp
-            # 만약 asic 온도를 대신 지원하는 모델일 경우 (D435 등은 둘 다 지원하거나 하나만 지원)
-            elif depth_sensor.supports(rs.option.asic_temperature):
-                asic_temp = depth_sensor.get_option(rs.option.asic_temperature)
-                return asic_temp
-        except Exception as e:
-            print(f"Failed to get temperature: {e}")
-            return None
-        return None
-
-    def get_dist_coeffs(self):
-        return self.dist_coeffs
 
 
 class Marker_Detection:
     def __init__(self):
-        # 어떤 마커를 인식시킬건지 정의
+        # Define which markers to detect
         self.dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         if hasattr(cv2.aruco, 'DetectorParameters_create'):
             self.parameters = cv2.aruco.DetectorParameters_create()
         else:
             self.parameters = cv2.aruco.DetectorParameters()
-        # 마커 인식 정밀도 향상을 위한 파라미터 튜닝
-        # 1. 서브픽셀 정밀도 극대화
+        # Parameter tuning for improving marker detection precision
+        # 1. Maximize sub-pixel precision
         self.parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.parameters.cornerRefinementWinSize = 5
         self.parameters.cornerRefinementMaxIterations = 50
         self.parameters.cornerRefinementMinAccuracy = 0.01
 
-        # 2. 이진화 세밀화 (조명 및 그림자 대응)
+        # 2. Refine binarization (for lighting and shadow robust)
         self.parameters.adaptiveThreshWinSizeMin = 3
         self.parameters.adaptiveThreshWinSizeMax = 23
-        self.parameters.adaptiveThreshWinSizeStep = 3  # 세밀한 스캔
-        self.parameters.adaptiveThreshConstant = 7     # 노이즈 대비 약간 낮춤
+        self.parameters.adaptiveThreshWinSizeStep = 3  # Fine scan
+        self.parameters.adaptiveThreshConstant = 7     # Adjusted lower for noise
 
-        # 3. 형상 근사 및 필터링
-        self.parameters.polygonalApproxAccuracyRate = 0.01 # 더 엄격한 사각형 검사
+        # 3. Shape approximation and filtering
+        self.parameters.polygonalApproxAccuracyRate = 0.01 # Stricter square check
         self.parameters.minDistanceToBorder = 3
         self.parameters.minMarkerPerimeterRate = 0.01
 
-        # 4. 내부 비트 샘플링 향상
-        self.parameters.perspectiveRemovePixelPerCell = 12 # 정밀한 비트 추출
+        # 4. Enhance internal bit sampling
+        self.parameters.perspectiveRemovePixelPerCell = 12 # Fine bit extraction
 
-        # 계산에 쓰일 카메라 내부 파라미터
+        # Intrinsic parameters used for calculation
         self.principal_point = [0, 0]
         self.fx = 0
         self.fy = 0
@@ -423,14 +107,15 @@ class Marker_Detection:
         
         self.lpf_alpha = 0.5
         self.prev_pts_dict = {}
+        self.prev_pnp_rot = {}
 
         self.focal_scale = 1.0# 0.99 # Focal length scaling factor for fine-tuning
 
-        # 인식할 마커 타입과 ID
+        # Marker type and ID to detect
         self.marker_type = None
         self.marker_id = None
         
-        self.marker_size_mm = 36.0 # 기본값, config에서 덮어씌워짐
+        self.marker_size_mm = 36.0 # Default value, overwritten by config
         self.markers_config = {}
         if tcpip_send:
             self.tcp_client = TCPClient("127.0.0.1", 5000)
@@ -443,7 +128,11 @@ class Marker_Detection:
         else:
             self.detector = None
 
-    # 연산에 필요한 카메라 파라미터 설정
+    def reset_tracking(self):
+        self.prev_pts_dict = {}
+        self.prev_pnp_rot = {}
+
+    # Set camera parameters required for calculation
     def set_intrinsics_param(self, param):
         self.principal_point = [param[0], param[1]]
         self.fx = param[2]
@@ -480,9 +169,9 @@ class Marker_Detection:
             return float(depth_image[y, x])*self.depth_resolution
         return 0.0
 
-    # 마커들의 중심좌표(4*4행렬)
+    # Center coordinates of markers (4x4 matrix)
     def detect(self, color_image, lpf = False, logging = False, depth_image = None, use_filter = True):
-        # [LEGACY] 이미지 전체 렌즈 왜곡 펴기 (CPU 처리 병목 발생 원인 -> 롤백 가능하도록 주석 처리)
+        # [LEGACY] Image-wide lens undistortion (causes CPU processing bottleneck -> Commented out)
         # pnp_dist_coeffs = self.dist_coeffs
         # if self.dist_coeffs is not None and np.any(self.dist_coeffs != 0):
         #     base_cam_mat = np.array([
@@ -490,12 +179,12 @@ class Marker_Detection:
         #         [0, self.fy, self.principal_point[1]],
         #         [0, 0, 1]
         #     ], dtype=np.float32)
-        #     # 이미지 전체 렌즈 왜곡 펴기 (마커 모서리 직선 복원)
+        #     # Image-wide lens undistortion (to restore marker edges to straight lines)
         #     color_image = cv2.undistort(color_image, base_cam_mat, self.dist_coeffs, None, base_cam_mat)
-        #     # 이미 왜곡을 폈으므로, 이후 solvePnP에서는 왜곡 파라미터 무시 (이중 보정 방지)
+        #     # Since distortion is already corrected, ignore distortion params in solvePnP to avoid double correction
         #     pnp_dist_coeffs = None
 
-        # [OPTIMIZED] 이미지 전체 undistort 대신, solvePnP에 distort 파라미터를 넘겨 0.01ms 내 보정
+        # [OPTIMIZED] Pass distortion parameters to solvePnP instead of doing full undistort (takes <0.01ms)
         pnp_dist_coeffs = self.dist_coeffs
             
         gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
@@ -504,7 +193,7 @@ class Marker_Detection:
         else:
             corners, ids, _ = cv2.aruco.detectMarkers(gray, self.dictionary, parameters=self.parameters)
         
-        # Step 2: 서브픽셀 정밀도 강제화
+        # Step 2: Enforce sub-pixel precision
         if corners is not None and len(corners) > 0:
             criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.001)
             for i in range(len(corners)):
@@ -513,7 +202,7 @@ class Marker_Detection:
         marker_centers_result = []
         
 
-        # 등록된 마커만 필터링 (tuple과 ndarray는 pop()을 쓸 수 없으므로 새로 리스트를 만듭니다)
+        # Filter only registered markers (create a new list since tuple and ndarray don't support pop)
         if ids is not None and len(ids) > 0 and self.marker_id is not None:
             valid_indices = []
             for i, mid in enumerate(ids):
@@ -526,7 +215,7 @@ class Marker_Detection:
             else:
                 corners, ids = (), None
 
-        # debugging (필터링이 끝난 마커들만 화면에 표시되게 위치를 조정합니다)
+        # debugging (Adjust positions so only filtered markers are displayed on screen)
         if imshow_when_detect:
             if ids is not None:
                 cv2.aruco.drawDetectedMarkers(color_image, corners, ids)
@@ -566,10 +255,28 @@ class Marker_Detection:
                 #     self.marker_depth = self.get_depth_from_depth_img(depth_image, center_px)
                 #     print(f"[Depth] Marker ID {marker_id} Center Depth: {self.marker_depth:.1f} mm")
 
-                success, rvec, tvec = cv2.solvePnP(obj_pts, c, cam_mat, pnp_dist_coeffs, flags=cv2.SOLVEPNP_IPPE)
-                if not success:
+                # --- IPPE Planar Ambiguity Disambiguation ---
+                pnp_res = cv2.solvePnPGeneric(obj_pts, c, cam_mat, pnp_dist_coeffs, flags=cv2.SOLVEPNP_IPPE)
+                num_sol = pnp_res[0] if len(pnp_res) > 0 else 0
+                if num_sol == 0 or len(pnp_res[1]) == 0:
                     continue
+                
+                rvecs = pnp_res[1]
+                tvecs = pnp_res[2]
+                reproj_errs = pnp_res[3] if len(pnp_res) > 3 else None
+
+                # Pick the lower-reprojection-error solution independently per frame (same as
+                # cv2.solvePnP(SOLVEPNP_IPPE), used up to 2026-09-07). Choosing the solution
+                # closest to the previous frame (introduced 2026-09-13) locks onto a wrong
+                # mirrored solution for whole runs of frames near a fronto-parallel view, which
+                # the per-frame spike filter in CalibratorBase.filter_sweep_dataset cannot remove.
+                best_idx = 0
+                if num_sol > 1 and reproj_errs is not None and len(reproj_errs) > 1:
+                    best_idx = int(np.argmin(np.asarray(reproj_errs).ravel()))
+                rvec = rvecs[best_idx]
+                tvec = tvecs[best_idx]
                 rot_matrix, _ = cv2.Rodrigues(rvec)
+
                 center_pos = tvec.flatten().tolist()
                 
                 # --- EMA & Slerp Smoothing ---
@@ -631,17 +338,36 @@ class Marker_Detection:
 
 
 class Marker_Transform:
-    def __init__(self, serial_number = None):
-        # Initialize
-        self.camera = RealSenseCamera(serial_number=serial_number)
+    def __init__(self, serial_number=None, *, sim=False, robot=None, robot_version='1.2', camera_factory=RealSenseCamera,
+                 simulation_factory=None):
+        # simulation_factory(version) -> the simulated pose sensor (core.calibration.simulation
+        # SimulationModel.create). Passed in so this comm module does not import the calibration maths.
+        self.simulation_factory = simulation_factory
+        self.sim = bool(sim)
+        self.camera = None
+        self.robot = robot
+        self.robot_version = str(robot_version).removeprefix('v')
+        self.rng = np.random.default_rng(42)
         self.marker_detection = Marker_Detection()
         
+        # The camera has to be open before the configs load: which model is connected decides which
+        # camera_info.yaml extrinsics and which camera_intrinsics_<model>.yaml apply.
+        # _load_all_configs() used to run first, so self.camera was still None and the connected
+        # model was never detected -- neither the bracket extrinsics nor the intrinsics were ever
+        # switched when the camera was swapped, and the mismatch warning could never fire.
+        if not self.sim:
+            try:
+                self.camera = camera_factory(serial_number=serial_number)
+            except (CameraUnavailableError, RuntimeError) as e:
+                print(f"[WARN] Camera unavailable: {e}. Falling back to simulation model.")
+                self.sim = True
+
         # Load configs globally in the wrapper class
         self._load_all_configs()
         
         # Setup Transforms
-        tf_vec_l = self.camera_config.get("Tf_to_marker_left", self.camera_config.get("Tf_to_marker", [0.022, 0.0, 0.18, 180.0, 0.0, -90.0]))
-        tf_vec_r = self.camera_config.get("Tf_to_marker_right", self.camera_config.get("Tf_to_marker", [0.022, 0.0, 0.18, 180.0, 0.0, -90.0]))
+        tf_vec_l = self.markers_config.get("Tf_to_marker_left", self.markers_config.get("Tf_to_marker", [0.022, 0.0, 0.18, 180.0, 0.0, -90.0]))
+        tf_vec_r = self.markers_config.get("Tf_to_marker_right", self.markers_config.get("Tf_to_marker", [0.022, 0.0, 0.18, 180.0, 0.0, -90.0]))
         head_base_vec = self.camera_config.get("head_base_to_cam", [0.009, -0.09, -0.085, 159.0, 0.0, 180.0])
         print(tf_vec_l)
         
@@ -652,87 +378,553 @@ class Marker_Transform:
         self.width = self.camera_config.get("width", 1280)
         self.height = self.camera_config.get("height", 720)
         self.fps = self.camera_config.get("fps", 30)
-        
-        print("Initializing Camera...")
-        self.camera.initialize_camera(self.width, self.height, self.fps)
-        
-        intrinsics = self.camera.get_principal_point_and_focal_length()
-        self.marker_detection.set_intrinsics_param(intrinsics)
 
-        depth_resolution = self.camera.get_depth_resolution()
-        self.marker_detection.set_depth_resolution(depth_resolution)
+        if self.sim:
+            self.simulation_model = self._create_simulation_model(self.robot_version)
 
-        dist_coeffs = self.camera.get_dist_coeffs()
-        self.marker_detection.set_dist_coeffs(dist_coeffs)
+        if self.camera is not None:
+            print("Initializing Camera...")
+            self.camera.initialize_camera(self.width, self.height, self.fps)
+            # initialize_camera now refuses to run at anything but the requested profile, so this
+            # should never trigger; kept as a guard. If the frames ever arrive at a different
+            # resolution than setting.yaml says, the calibrated intrinsics would be scaled to the
+            # wrong size and put a constant factor on every solvePnP range.
+            actual = (getattr(self.camera, "width", None), getattr(self.camera, "height", None))
+            if all(actual) and actual != (self.width, self.height):
+                print(f"[WARNING] Camera negotiated {actual[0]}x{actual[1]}, not the "
+                      f"{self.width}x{self.height} requested in setting.yaml. Using what it gave.")
+                self.width, self.height = actual
+                self.fps = getattr(self.camera, "fps", self.fps)
 
-        self.marker_detection.set_baseline(self.camera.baseline)
-        
-        # [NEW] 내부 파라미터 보정 파일(camera_intrinsics.yaml) 사용 설정
-        if use_calib_int:
-            # Search for config in current dir or parent dir (to support both source and installed structures)
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            calib_file = os.path.join(base_dir, "config", "camera_intrinsics.yaml")
-            if not os.path.exists(calib_file):
-                calib_file = os.path.join(os.path.dirname(base_dir), "config", "camera_intrinsics.yaml")
-            if os.path.exists(calib_file):
-                try:
-                    with open(calib_file, "r") as f:
-                        calib_data = yaml.safe_load(f)
-                    
-                    mtx = np.array(calib_data["camera_matrix"])
-                    dist = np.array(calib_data["dist_coeffs"])
-                    
-                    calib_w = calib_data.get("width")
-                    calib_h = calib_data.get("height")
-                    
-                    # 해상도가 다를 경우 비례적으로 스케일 조정
-                    if calib_w and calib_h and (calib_w != self.width or calib_h != self.height):
-                        scale_x = self.width / calib_w
-                        scale_y = self.height / calib_h
-                        
-                        if abs(scale_x - scale_y) > 0.03:
-                            print(f"\n[WARNING] Aspect ratio mismatch! Calibration: {calib_w}x{calib_h}, Current: {self.width}x{self.height}")
-                        
-                        mtx[0,0] *= scale_x # fx
-                        mtx[1,1] *= scale_y # fy
-                        mtx[0,2] *= scale_x # ppx
-                        mtx[1,2] *= scale_y # ppy
-                        print(f"\n[INFO] Scaled intrinsics from {calib_w}x{calib_h} to {self.width}x{self.height} (Scale X:{scale_x:.2f}, Y:{scale_y:.2f})")
+            # Factory values first; apply_calibrated_intrinsics() layers the calibration on top and
+            # can be called again later (after a save) without reconnecting the camera.
+            self._factory_intrinsics = list(self.camera.get_principal_point_and_focal_length())
+            self._factory_dist_coeffs = self.camera.get_dist_coeffs()
+            self.marker_detection.set_intrinsics_param(self._factory_intrinsics)
+            self.marker_detection.set_dist_coeffs(self._factory_dist_coeffs)
 
-                    # Marker_Detection에 보정된 파라미터 주입
-                    # 신규 인터페이스 [ppx, ppy, fx, fy]
-                    new_intrinsics = [mtx[0,2], mtx[1,2], mtx[0,0], mtx[1,1]]
-                    self.marker_detection.set_intrinsics_param(new_intrinsics)
-                    self.marker_detection.set_dist_coeffs(dist)
-                    
-                    print(f"[INFO] --- Loaded Calibrated Intrinsics from {calib_file} ---")
-                    print(f"       fx: {mtx[0,0]:.2f}, fy: {mtx[1,1]:.2f}, ppx: {mtx[0,2]:.2f}, ppy: {mtx[1,2]:.2f}")
-                    print(f"       dist: {dist}")
-                except Exception as e:
-                    print(f"\n[ERROR] Failed to load {calib_file}: {e}")
-            else:
-                print(f"\n[WARNING] Calibrated Intrinsics file {calib_file} NOT FOUND. Using factory defaults.")
-        
+            depth_resolution = self.camera.get_depth_resolution()
+            self.marker_detection.set_depth_resolution(depth_resolution)
+
+            self.marker_detection.set_baseline(self.camera.baseline)
+
+            # Apply the calibrated intrinsics that _load_all_configs resolved for this camera model.
+            # active_intrinsics_path is None when no calibration file matches the connected model;
+            # the factory intrinsics set above then stay in use. Applying another model's file is
+            # worse than having none: D405 fx 660 on a D435 (factory fx 916) makes every solvePnP
+            # range read 28% short, which is what wrecked the marker bracket poses.
+            self.apply_calibrated_intrinsics(self.active_intrinsics_path)
+
+            # Always default to Auto Exposure on initialization
+            self.camera.set_exposure(6000.0, auto_exposure=True)
+
+        self.temp_supported = bool(self.camera is not None and getattr(self, 'temp_supported', False))
         self.temp_history = []
+        self.set_marker_type("plate")
+
+    def apply_calibrated_intrinsics(self, calib_file):
+        """Make the detector use `calib_file`'s intrinsics now, on top of the factory values.
+
+        Runs at camera start-up, and again right after the intrinsics calibration is saved: the
+        detector used to pick up a saved calibration only on the next start, so a session that
+        calibrated, saved and carried straight on ran its sweeps on the old numbers while the file
+        already held the new ones. With no usable file the factory values are restored.
+        Returns True when a calibration file was applied.
+        """
+        factory = list(getattr(self, "_factory_intrinsics", None) or [])
+        if not factory:
+            return False
+        self.marker_detection.set_intrinsics_param(factory)
+        self.marker_detection.set_dist_coeffs(getattr(self, "_factory_dist_coeffs", None))
+        if calib_intrinsics_mode not in ("principal_point", "full"):
+            return False
+        if not calib_file:
+            print(f"\n[WARNING] No calibrated intrinsics for '{self.camera_model}'. Using the camera's factory intrinsics.")
+            return False
+        try:
+            calib_data = ConfigStorage.load(calib_file)
+
+            mtx = np.array(calib_data["camera_matrix"], dtype=float)
+            dist = np.array(calib_data["dist_coeffs"], dtype=float)
+
+            calib_w = calib_data.get("width")
+            calib_h = calib_data.get("height")
+
+            # Proportionally adjust scale if resolution differs
+            if calib_w and calib_h and (calib_w != self.width or calib_h != self.height):
+                scale_x = self.width / calib_w
+                scale_y = self.height / calib_h
+
+                if abs(scale_x - scale_y) > 0.03:
+                    print(f"\n[WARNING] Aspect ratio mismatch! Calibration: {calib_w}x{calib_h}, Current: {self.width}x{self.height}")
+
+                mtx[0,0] *= scale_x # fx
+                mtx[1,1] *= scale_y # fy
+                mtx[0,2] *= scale_x # ppx
+                mtx[1,2] *= scale_y # ppy
+                print(f"\n[INFO] Scaled intrinsics from {calib_w}x{calib_h} to {self.width}x{self.height} (Scale X:{scale_x:.2f}, Y:{scale_y:.2f})")
+
+            # Inject calibrated parameters to Marker_Detection
+            # Interface [ppx, ppy, fx, fy]
+            if calib_intrinsics_mode == "full":
+                new_intrinsics = [mtx[0,2], mtx[1,2], mtx[0,0], mtx[1,1]]
+                self.marker_detection.set_dist_coeffs(dist)
+            else:
+                new_intrinsics = [mtx[0,2], mtx[1,2], factory[2], factory[3]]
+            self.marker_detection.set_intrinsics_param(new_intrinsics)
+            self.active_intrinsics_path = calib_file
+
+            print(f"[INFO] --- Calibrated intrinsics ({calib_intrinsics_mode}) from {calib_file} ---")
+            print(f"       factory   : fx {factory[2]:.2f}, fy {factory[3]:.2f}, ppx {factory[0]:.2f}, ppy {factory[1]:.2f}")
+            print(f"       in use    : fx {new_intrinsics[2]:.2f}, fy {new_intrinsics[3]:.2f}, ppx {new_intrinsics[0]:.2f}, ppy {new_intrinsics[1]:.2f}")
+            if calib_intrinsics_mode == "full":
+                print(f"       dist: {dist}")
+            else:
+                print(f"       dist (factory, in use): {getattr(self, '_factory_dist_coeffs', None)}  "
+                      f"| calibrated file had: {dist}")
+            return True
+        except Exception as e:
+            print(f"\n[ERROR] Failed to load {calib_file}: {e}")
+            return False
+
+    def bind_robot(self, robot, robot_version):
+        version = str(robot_version).removeprefix('v')
+        if self.sim and (getattr(self, 'simulation_model', None) is None or self.simulation_model.version != version):
+            self.simulation_model = self._create_simulation_model(version)
+            self.rng = np.random.default_rng(self.simulation_model.config.get('seed', 42))
+        self.robot, self.robot_version = robot, version
+        if robot is not None:
+            self._apply_marker_bracket_version(version)
+
+    def _create_simulation_model(self, version):
+        if self.simulation_factory is None:
+            raise RuntimeError("Simulation mode (or no camera) needs simulation_factory; "
+                               "CalibrationCore.connect_camera passes SimulationModel.create.")
+        return self.simulation_factory(version)
+
+    def _apply_marker_bracket_version(self, version):
+        """Make the live `Tf_to_marker_<side>` belong to this robot version's bracket.
+
+        The v1.2 and v1.3 marker brackets are mounted at a different place and angle, and the
+        live value is what the detector turns a marker pose into a tool pose with, so a leftover
+        from the other version puts every observation ~67 mm and 90 deg out. The version-suffixed
+        nominals already in setting.yaml say which is which.
+
+        Only ever called for a connected robot: that is the one authoritative source of the
+        version. Disconnecting falls back to the '1.2' default, which says nothing about the
+        brackets, and acting on it would throw away a v1.3 setup's calibration.
+        """
+        changes = resolve_marker_brackets(self.markers_config, version)
+        if not changes:
+            return
+        for side, value in changes.items():
+            self.markers_config[f"Tf_to_marker_{side}"] = list(value)
+            setattr(self, f"Tf_to_marker_tf_{side}", self.make_transform(value))
+        self.marker_detection.markers_config = self.markers_config
+        from core.storage import CONFIG_PATHS
+        setting_path = CONFIG_PATHS.get("setting_yaml")
+        if not setting_path or not os.path.exists(setting_path):
+            return
+        try:
+            ConfigStorage.update_values(setting_path, {("marker", f"Tf_to_marker_{side}"): list(value)
+                                                       for side, value in changes.items()})
+            print(f"[INFO] Updated setting.yaml marker brackets for robot v{version}: "
+                  + ", ".join(f"Tf_to_marker_{side}={value}" for side, value in changes.items()))
+        except Exception as e:
+            print(f"[WARNING] Could not write the v{version} marker brackets to setting.yaml: {e}")
+
+    def set_marker_type(self, marker_type):
+        if self.marker_detection is not None:
+            self.marker_detection.set_marker_type(marker_type)
+
+    def set_camera_exposure(self, exposure_val, auto_exposure=False):
+        if self.camera is None: return False
+        return self.camera.set_exposure(exposure_val, auto_exposure)
+
+    def get_camera_exposure(self):
+        if self.camera is None: return True, 6000.0
+        return self.camera.get_exposure()
+
+    def get_camera_info(self):
+        """Connected camera, the model family its settings come from, stream and intrinsics file."""
+        if self.camera is None or not hasattr(self.camera, "get_stream_info"):
+            return None
+        info = dict(self.camera.get_stream_info())
+        info["camera_model"] = getattr(self, "camera_model", None)
+        path = getattr(self, "active_intrinsics_path", None)
+        info["intrinsics_file"] = os.path.basename(path) if path else None
+        info["intrinsics_serial_matched"] = bool(getattr(self, "intrinsics_serial_matched", False))
+        info["intrinsics_source"] = getattr(self, "intrinsics_source", None)
+        return info
+
+    def get_camera_exposure_range(self):
+        """(min, max, step, default) this camera's colour sensor accepts, or None."""
+        if self.camera is None: return None
+        return self.camera.get_exposure_range()
+
+    def get_camera_exposure_unit_us(self):
+        """Microseconds per step of this camera's exposure setpoint (100 on a D435 RGB module)."""
+        if self.camera is None or not hasattr(self.camera, "get_exposure_unit_us"): return 1.0
+        return self.camera.get_exposure_unit_us()
+
+    def get_actual_exposure(self):
+        if self.camera is None: return 6000.0
+        return self.camera.get_actual_exposure()
 
     def _load_all_configs(self):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        setting_config_path = os.path.join(base_dir, "config", "setting.yaml")
-        if not os.path.exists(setting_config_path):
-            setting_config_path = os.path.join(os.path.dirname(base_dir), "config", "setting.yaml")
-            
+        """Resolve every camera-dependent config from the connected camera's model.
+
+        Order matters: the RealSense is already open here, so `camera.device_name` names the
+        model. Everything keys off the model *family* (`D435i`/`D435f` -> `D435`), because the
+        variants share one housing, one bracket and one set of optics; only the three-digit body
+        number matters. Both stores follow the same rule:
+
+          * bracket extrinsics -> the family's entry in camera_info.yaml
+          * intrinsics         -> config/camera_intrinsics_<family>.yaml
+
+        When a store has nothing for the connected family, this records it on
+        `extrinsics_missing` / `intrinsics_missing` for the UI to report, and leaves the values
+        alone rather than guessing. Startup continues either way.
+        """
+        from core.storage import CONFIG_PATHS
+        setting_config_path = CONFIG_PATHS.get("setting_yaml")
+        if not setting_config_path or not os.path.exists(setting_config_path):
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            setting_config_path = os.path.join(base_dir, "config", "setting.yaml")
+            if not os.path.exists(setting_config_path):
+                setting_config_path = os.path.join(os.path.dirname(base_dir), "config", "setting.yaml")
+
+        self.extrinsics_missing = False
+        self.intrinsics_missing = False
+        self.intrinsics_mismatch = False
+        self.calib_device_name = ""
+        self.active_intrinsics_path = None
+        self.camera_model = None
+        # Serial of the connected unit (None in simulation), whether its own intrinsics file was
+        # found, and where the intrinsics in use came from: "serial", "model", "file" (simulation /
+        # no camera) or "factory".
+        self.camera_serial = getattr(self.camera, "serial_number", None) or None
+        self.intrinsics_serial_matched = False
+        self.intrinsics_source = None
+
         try:
-            with open(setting_config_path, "r") as f:
-                config_data = yaml.safe_load(f)
-                self.camera_config = config_data.get("camera", {})
-                self.markers_config = config_data.get("marker", config_data) # fallback
-                self.marker_detection.markers_config = self.markers_config
-                
-                print(f"- Loaded Setting Config from {os.path.basename(setting_config_path)}")
+            config_data = ConfigStorage.load(setting_config_path)
+
+            camera_config = config_data.get("camera", {})
+            yaml_device_name = camera_config.get("device_name")
+            connected_device_name = getattr(self.camera, "device_name", None)
+
+            # The family, not the full name: an 'Intel RealSense D435i' is stored and looked up as
+            # 'D435', so a variant never creates a second, divergent set of entries.
+            self.camera_model = camera_model_family(connected_device_name)
+            if connected_device_name:
+                print(f"[INFO] Connected camera '{connected_device_name}' -> model family '{self.camera_model}'")
+
+            self.temp_supported = False
+            info_file = CONFIG_PATHS.get("camera_info")
+            if not info_file or not os.path.exists(info_file):
+                info_file = os.path.join(os.path.dirname(setting_config_path), "camera_info.yaml")
+                if not os.path.exists(info_file) and getattr(sys, "frozen", False):
+                    info_file = os.path.join(sys._MEIPASS, "config", "camera_info.yaml")
+
+            info_data = {}
+            if os.path.exists(info_file):
+                try:
+                    info_data = ConfigStorage.load(info_file)
+                except Exception as e:
+                    print(f"[WARNING] Failed to read camera_info.yaml: {e}")
+
+            target_model = self.camera_model or camera_model_family(yaml_device_name)
+            matched_info_key = lookup_camera_info_key(info_data, target_model)
+
+            if matched_info_key:
+                cam_ext = info_data[matched_info_key]
+                self.temp_supported = cam_ext.get("temp_supported", False)
+                info_head_base = cam_ext.get("head_base_to_cam")
+                info_mount = cam_ext.get("mount_to_cam")
+                info_mount_link = cam_ext.get("camera_mount_link", "link_head_2")
+
+                current_dev = camera_config.get("device_name")
+                current_head_base = camera_config.get("head_base_to_cam")
+                current_mount = camera_config.get("mount_to_cam")
+                current_mount_link = camera_config.get("camera_mount_link")
+
+                def is_diff(v1, v2):
+                    if v1 is None or v2 is None:
+                        return v1 != v2
+                    try:
+                        return not np.allclose(v1, v2, atol=1e-5)
+                    except Exception:
+                        return v1 != v2
+
+                # camera_info.yaml holds each model's CAD nominal. The *_nominal keys in
+                # setting.yaml record which model the live extrinsics were derived from, so they
+                # are what decides whether the live values still belong to this camera:
+                #
+                #   nominals match  -> the live values are this model's nominal plus a Step 1.5 /
+                #                      Step 2 calibration (or a hand measurement). Keep them;
+                #                      overwriting on every launch silently threw them away.
+                #   nominals differ -> they came from a different camera. Reload the nominal.
+                #
+                # Comparing device_name alone was not enough: editing device_name by hand in
+                # setting.yaml made the two agree while the extrinsics stayed on the old model.
+                nominal_diff = (is_diff(camera_config.get("mount_to_cam_nominal"), info_mount)
+                                or is_diff(camera_config.get("head_base_to_cam_nominal"), info_head_base))
+                dev_diff = (self.camera_model is not None
+                            and camera_model_family(current_dev) != self.camera_model)
+                missing = current_head_base is None or current_mount is None or current_mount_link is None
+                model_changed = dev_diff or nominal_diff or missing
+
+                if not model_changed and (is_diff(current_head_base, info_head_base)
+                                          or is_diff(current_mount, info_mount)):
+                    print(f"[INFO] setting.yaml camera extrinsics differ from the '{matched_info_key}' nominal in "
+                          f"camera_info.yaml; keeping setting.yaml (calibrated or edited values).")
+
+                changes = {}
+                if model_changed:
+                    if dev_diff:
+                        print(f"[INFO] Connected camera '{connected_device_name}' (family '{self.camera_model}') "
+                              f"differs from setting.yaml '{yaml_device_name}'. Loading its nominal extrinsics...")
+                    elif nominal_diff:
+                        print(f"[INFO] setting.yaml extrinsics were derived from another camera model "
+                              f"(mount_to_cam_nominal {camera_config.get('mount_to_cam_nominal')} != "
+                              f"'{matched_info_key}' {info_mount}). Reloading the nominal...")
+                    if missing:
+                        print(f"[INFO] setting.yaml has no camera extrinsics yet. Loading the "
+                              f"'{matched_info_key}' nominal from camera_info.yaml...")
+
+                    camera_config["device_name"] = self.camera_model or matched_info_key
+                    changes[("camera", "device_name")] = camera_config["device_name"]
+                    if info_head_base is not None:
+                        camera_config["head_base_to_cam"] = list(info_head_base)
+                        changes[("camera", "head_base_to_cam")] = list(info_head_base)
+                    if info_mount is not None:
+                        camera_config["mount_to_cam"] = list(info_mount)
+                        changes[("camera", "mount_to_cam")] = list(info_mount)
+                    if info_mount_link is not None:
+                        camera_config["camera_mount_link"] = info_mount_link
+                        changes[("camera", "camera_mount_link")] = info_mount_link
+
+                # The nominals are the CAD numbers for whichever camera is mounted now, so they
+                # track camera_info.yaml unconditionally. Nothing refreshed them before, and
+                # Step 1.5 / Step 2 anchor their baseline to them -- a D405 nominal left behind
+                # meant a D435 was being calibrated against the wrong CAD pose.
+                if info_mount is not None and is_diff(camera_config.get("mount_to_cam_nominal"), info_mount):
+                    camera_config["mount_to_cam_nominal"] = list(info_mount)
+                    changes[("camera", "mount_to_cam_nominal")] = list(info_mount)
+                if info_head_base is not None and is_diff(camera_config.get("head_base_to_cam_nominal"), info_head_base):
+                    camera_config["head_base_to_cam_nominal"] = list(info_head_base)
+                    changes[("camera", "head_base_to_cam_nominal")] = list(info_head_base)
+
+                if changes:
+                    config_data["camera"] = camera_config
+                    ConfigStorage.update_values(setting_config_path, changes)
+                    print(f"[INFO] Updated setting.yaml for {matched_info_key} from camera_info.yaml "
+                          f"(head_base_to_cam: {camera_config.get('head_base_to_cam')}, "
+                          f"mount_to_cam: {camera_config.get('mount_to_cam')})")
+            else:
+                self.extrinsics_missing = bool(target_model)
+                if not os.path.exists(info_file):
+                    print(f"[WARNING] camera_info.yaml not found at {info_file}")
+                elif target_model:
+                    print(f"[ERROR] camera_info.yaml has no entry for '{target_model}'. The bracket "
+                          f"extrinsics (head_base_to_cam / mount_to_cam) for this model have to be "
+                          f"measured and added to camera_info.yaml; setting.yaml is left untouched.")
+
+            self.camera_config = camera_config
+            self.markers_config = config_data.get("marker", {}) or {}
+            # Legacy fallback
+            for lk in ["Tf_to_marker_left", "Tf_to_marker_right", "Tf_to_marker_left_v12", "Tf_to_marker_right_v12", "Tf_to_marker_left_v13", "Tf_to_marker_right_v13"]:
+                if lk not in self.markers_config and lk in camera_config:
+                    self.markers_config[lk] = camera_config[lk]
+            self.marker_detection.markers_config = self.markers_config
+            print(f"- Loaded Setting Config from {os.path.basename(setting_config_path)}")
+            print(f"  * head_base_to_cam: {camera_config.get('head_base_to_cam')}")
+            print(f"  * mount_to_cam: {camera_config.get('mount_to_cam')}")
+
+            self._resolve_camera_intrinsics()
         except Exception as e:
             print(f"- Warning: Could not load {setting_config_path}: {e}")
             self.camera_config = {}
             self.markers_config = {}
+
+    def _resolve_camera_intrinsics(self):
+        """Point `active_intrinsics_path` at the intrinsics belonging to the connected model.
+
+        camera_intrinsics.yaml is the working file the detector reads; camera_intrinsics_<family>.yaml
+        is each model's saved calibration. When the working file belongs to another model, the
+        outgoing one is archived to its own store and this model's store is copied in. With no
+        store for this model, `active_intrinsics_path` stays None so the camera's factory
+        intrinsics are used -- another model's numbers are far worse than none.
+        """
+        working = camera_intrinsics_path()
+        working_data = {}
+        if os.path.exists(working):
+            try:
+                working_data = ConfigStorage.load(working) or {}
+            except Exception as e:
+                print(f"[WARNING] Failed to parse camera_intrinsics.yaml: {e}")
+        self.calib_device_name = working_data.get("device_name", "")
+        working_family = camera_model_family(self.calib_device_name)
+
+        if self.camera_model is None:
+            # No camera (simulation, or it failed to open): keep whatever is on file.
+            self.active_intrinsics_path = working if working_data else None
+            self.intrinsics_source = "file" if working_data else None
+            return
+
+        if self._use_serial_intrinsics(working, working_data, working_family):
+            return
+
+        if working_family == self.camera_model:
+            self.active_intrinsics_path = working if working_data else None
+            self.intrinsics_missing = not working_data
+            self.intrinsics_source = "model" if working_data else "factory"
+            return
+
+        self.intrinsics_mismatch = bool(working_family)
+        if working_family:
+            print(f"[WARNING] camera_intrinsics.yaml holds '{self.calib_device_name}' intrinsics but a "
+                  f"'{self.camera_model}' is connected.")
+
+        store = camera_intrinsics_path(self.camera_model)
+        source = store
+        if not os.path.exists(source) and getattr(sys, "frozen", False):
+            # A frozen build seeds config/ next to the executable from the bundle on first run.
+            # If that copy never happened -- a read-only install folder, a partial first run --
+            # the model's store is still readable inside the bundle, same fallback camera_info
+            # already uses. Without it a packaged build silently drops to factory intrinsics.
+            bundled = os.path.join(sys._MEIPASS, "config", os.path.basename(store))
+            if os.path.exists(bundled):
+                source = bundled
+                print(f"[INFO] config/ was not seeded; reading {os.path.basename(store)} from the bundle.")
+        store_data = None
+        if os.path.exists(source):
+            try:
+                store_data = ConfigStorage.load(source) or {}
+                if "camera_matrix" not in store_data:
+                    raise KeyError("camera_matrix")
+            except Exception as e:
+                store_data = None
+                print(f"[ERROR] Failed to read {source}: {e}")
+
+        if store_data is None:
+            self.intrinsics_missing = True
+            self.active_intrinsics_path = None
+            self.intrinsics_source = "factory"
+            print(f"[ERROR] No intrinsics calibration for '{self.camera_model}' "
+                  f"({os.path.basename(store)} not found or unusable). Falling back to the camera's "
+                  f"factory intrinsics -- run the Step 1 intrinsics calibration and save it.")
+            return
+
+        # Archive whatever camera_intrinsics.yaml held before replacing it, so swapping back does
+        # not lose that calibration. A file with no device_name cannot be attributed to a model --
+        # versions before the model stores existed wrote none -- and gating the archive on a known
+        # model meant exactly those files were overwritten without a copy. Park them under a
+        # timestamp instead; the replacement is stamped with a device_name, so this runs once.
+        if working_data:
+            outgoing = (camera_intrinsics_path(working_family) if working_family
+                        else camera_intrinsics_path(f"unknown_{time.strftime('%Y%m%d_%H%M%S')}"))
+            try:
+                ConfigStorage.save(outgoing, working_data)
+                print(f"[INFO] Archived the previous "
+                      f"{working_family or 'unidentified'} intrinsics to {os.path.basename(outgoing)}")
+            except Exception as e:
+                print(f"[WARNING] Could not archive the previous intrinsics to {outgoing}: {e}")
+
+        store_data["device_name"] = self.camera_model
+        self.intrinsics_source = "model"
+        try:
+            ConfigStorage.save(working, store_data)
+            ConfigStorage.save(store, store_data)
+            self.active_intrinsics_path = working
+            self.intrinsics_mismatch = False
+            self.calib_device_name = self.camera_model
+            print(f"[INFO] Loaded the '{self.camera_model}' intrinsics from {os.path.basename(store)} "
+                  f"into camera_intrinsics.yaml")
+        except Exception as e:
+            # Still usable read-only even if the working copy could not be written.
+            self.active_intrinsics_path = store
+            print(f"[WARNING] Could not update camera_intrinsics.yaml ({e}); "
+                  f"reading {os.path.basename(store)} directly.")
+
+    def _use_serial_intrinsics(self, working, working_data, working_family):
+        """Use this unit's own calibration, config/camera_intrinsics/<serial>.yaml, when it has one
+        (or when the working file is already stamped with its serial). Returns False to fall back
+        to the per-model store. The outgoing working file is archived first, as for a model swap.
+        """
+        serial = self.camera_serial
+        if not serial:
+            return False
+        path = camera_intrinsics_serial_path(serial)
+        data = None
+        if path and os.path.exists(path):
+            try:
+                data = ConfigStorage.load(path) or {}
+                if "camera_matrix" not in data:
+                    raise KeyError("camera_matrix")
+            except Exception as e:
+                data = None
+                print(f"[ERROR] Failed to read {path}: {e}")
+        if data is None:
+            if working_data and str(working_data.get("serial_number") or "") == str(serial) \
+                    and "camera_matrix" in working_data:
+                data, path = working_data, working
+            else:
+                print(f"[INFO] No intrinsics calibrated for camera S/N {serial}; using the "
+                      f"'{self.camera_model}' model calibration if there is one.")
+                return False
+
+        if working_data and path != working:
+            other = working_data.get("serial_number")
+            if other and str(other) != str(serial):
+                outgoing = camera_intrinsics_serial_path(other)
+                if outgoing and os.path.exists(outgoing):
+                    outgoing = None      # that unit's own file already holds it
+            elif not other and working_family != self.camera_model:
+                outgoing = (camera_intrinsics_path(working_family) if working_family
+                            else camera_intrinsics_path(f"unknown_{time.strftime('%Y%m%d_%H%M%S')}"))
+            else:
+                outgoing = None          # same model, no serial: the model store keeps it
+            if outgoing:
+                try:
+                    os.makedirs(os.path.dirname(outgoing), exist_ok=True)
+                    ConfigStorage.save(outgoing, working_data)
+                    print(f"[INFO] Archived the previous intrinsics to {outgoing}")
+                except Exception as e:
+                    print(f"[WARNING] Could not archive the previous intrinsics to {outgoing}: {e}")
+
+        data = dict(data)
+        data["device_name"] = self.camera_model
+        data["serial_number"] = str(serial)
+        self.active_intrinsics_path = working
+        if path != working:
+            try:
+                ConfigStorage.save(working, data)
+            except Exception as e:
+                self.active_intrinsics_path = path
+                print(f"[WARNING] Could not update camera_intrinsics.yaml ({e}); reading {path} directly.")
+        self.calib_device_name = self.camera_model
+        self.intrinsics_missing = False
+        self.intrinsics_mismatch = False
+        self.intrinsics_serial_matched = True
+        self.intrinsics_source = "serial"
+        print(f"[INFO] Loaded the intrinsics calibrated for camera S/N {serial} ({self.camera_model}).")
+        return True
+
+    def reload_saved_intrinsics(self):
+        """Re-read the intrinsics files and apply them to the detector, as a reconnect would.
+
+        For a save made while the camera is open: the unit's new S/N file was otherwise not
+        recognized (source, registered or not) until the camera was reconnected.
+        Returns True when a calibration file was applied."""
+        self.intrinsics_missing = False
+        self.intrinsics_mismatch = False
+        self.intrinsics_serial_matched = False
+        self.intrinsics_source = None
+        self._resolve_camera_intrinsics()
+        return self.apply_calibrated_intrinsics(self.active_intrinsics_path)
+
     def set_marker_type(self, marker_type="plate"):
         self.marker_detection.set_marker_type(marker_type)
     def make_transform(self, data):
@@ -767,7 +959,7 @@ class Marker_Transform:
     def calc_cam_to_tool(self, camera_to_marker_tf, side="left"):
         try:
             target_tf = self.Tf_to_marker_tf_left if side == "left" else self.Tf_to_marker_tf_right
-            # target_tf is in meters now. camera_to_marker_tf is also in meters.
+            # target_tf is in meters. camera_to_marker_tf is also in meters.
             tf_to_marker_inv = np.linalg.inv(target_tf)
         
             if tcpip_send:
@@ -776,9 +968,6 @@ class Marker_Transform:
                 cam_to_tool_tf = camera_to_marker_tf
             cam_to_tool_vec = cam_to_tool_tf.flatten()
             
-            cam_to_tool_vec[3] /= 1000
-            cam_to_tool_vec[7] /= 1000
-            cam_to_tool_vec[11] /= 1000
             if tcpip_send and len(cam_to_tool_vec) > 0:
                 self.marker_detection.tcp_client.send_pose(cam_to_tool_vec) 
             return cam_to_tool_vec
@@ -786,45 +975,73 @@ class Marker_Transform:
             print("Singular matrix, cannot invert")
             return None
 
-    def get_marker_transform(self, sampling_time=0, side="left", use_filter=None):
+    def get_marker_transform(self, sampling_time=0, side="left", use_filter=None, *, q_encoder=None):
+        if not np.isfinite(sampling_time) or sampling_time < 0:
+            raise ValueError('sampling_time must be finite and nonnegative')
+        if self.sim and self.robot is None and q_encoder is None:
+            raise RuntimeError('A connected SDK robot or q_encoder is required for simulated observations')
         if use_filter is None:
             use_filter = (sampling_time == 0)
         lpf = False
         # Collection array for sampling -> dict of lists
         collected_transforms = {} # { marker_id: [tf_vectors...] }
         sampled_temps = []
-        start_time = time.time()
+        start_time = time.monotonic()
 
         if sampling_time > 0:
             self.marker_detection.prev_pts_dict = {}
+            self.marker_detection.prev_pnp_rot = {}
             lpf = True
 
         while True:
             try:
-                if not self.camera.camera_monitoring:
-                    self.camera.capture_image()
-                color_img = self.camera.get_color_image()
-                depth_img = self.camera.get_depth_image()
-                if color_img is None:
-                    time.sleep(0.01)
-                    if sampling_time == 0 : return None
-                    continue
-                
-                marker_transforms = self.marker_detection.detect(color_img, lpf=lpf, depth_image=depth_img, use_filter=use_filter)
+                if self.sim:
+                    if q_encoder is not None:
+                        q = np.asarray(q_encoder)
+                    elif self.robot is not None:
+                        q = np.asarray(self.robot.get_state().position)
+                    else:
+                        q = np.zeros(26)
+                    sides = ['right', 'left'] if side == 'all' else [side]
+                    marker_transforms = [
+                        ('plate_' + arm, self.simulation_model.marker_pose(self.robot, q, arm, self.rng).ravel())
+                        for arm in sides]
+                else:
+                    if self.camera is None:
+                        time.sleep(0.01)
+                        if sampling_time == 0: return None
+                        continue
+                    if not self.camera.camera_monitoring:
+                        self.camera.capture_image()
+                    color_img = self.camera.get_color_image()
+                    depth_img = self.camera.get_depth_image()
+                    if color_img is None:
+                        time.sleep(0.01)
+                        if sampling_time == 0: return None
+                        continue
+                    
+                    raw_transforms = self.marker_detection.detect(color_img, lpf=lpf, depth_image=depth_img, use_filter=use_filter)
+                    # Real detector coordinates are millimetres. Normalize to meters at observation boundary.
+                    normalized = []
+                    for marker_id, values in raw_transforms:
+                        transform = np.asarray(values, dtype=float).reshape(4, 4).copy()
+                        transform[:3, 3] /= 1000.0
+                        normalized.append((marker_id, transform.ravel()))
+                    marker_transforms = normalized
+
                 for marker_id_or_group, tf_list in marker_transforms:
                     if marker_id_or_group not in collected_transforms:
                         collected_transforms[marker_id_or_group] = []
                     collected_transforms[marker_id_or_group].append(tf_list)
-                # -------------------------------------------------------------
                 
                 # Check timeout if sampling
-                if sampling_time == 0 or (sampling_time > 0 and (time.time() - start_time > sampling_time)):
+                if sampling_time == 0 or (sampling_time > 0 and (time.monotonic() - start_time >= sampling_time)):
                     break
                         
             except KeyboardInterrupt:
                 raise
             
-            # CPU 점유율을 낮추기 위한 미세한 대기
+            # Small sleep to reduce CPU utilization
             time.sleep(0.01)
             
         final_results = {}
@@ -861,7 +1078,7 @@ class Marker_Transform:
                     U[:, 2] *= -1
                     final_R = U @ Vt
                 
-                avg_cam_to_marker_tf = np.eye(4, dtype=np.float32)
+                avg_cam_to_marker_tf = np.eye(4, dtype=float)
                 avg_cam_to_marker_tf[0:3, 0:3] = final_R
                 avg_cam_to_marker_tf[0:3, 3] = final_translation
                 
@@ -872,9 +1089,7 @@ class Marker_Transform:
                     final_results[marker_id] = cam_to_tool_vec
         elif sampling_time == 0:
             for marker_id, tfs in collected_transforms.items():
-                # For sampling_time == 0, there is only one frame of transforms
-                # and thus tfs should have only length 1
-                camera_to_marker_tf = np.array(tfs[-1], dtype=np.float32).reshape(4, 4)
+                camera_to_marker_tf = np.array(tfs[-1], dtype=float).reshape(4, 4)
                 
                 calc_side = "left" if "left" in str(marker_id) else "right"
                 cam_to_tool_vec = self.calc_cam_to_tool(camera_to_marker_tf, side=calc_side)
@@ -899,3 +1114,139 @@ class Marker_Transform:
             return final_results
         else:
             return None
+
+
+def camera_model_family(name):
+    """'Intel RealSense D435i' -> 'D435'. Variants of one model (D435i has an IMU, D435f an IR
+    filter) share the housing and optics, so they share the mount-to-camera extrinsics; only the
+    number identifies the body. D405 and D455 are different housings and stay separate."""
+    if not name:
+        return None
+    match = re.search(r"[Dd](\d{3})", str(name))
+    return f"D{match.group(1)}" if match else None
+
+
+def lookup_camera_info_key(info_data, target_model):
+    """Exact entry for this model if camera_info.yaml has one, otherwise the model family.
+
+    Letting the family answer means a D435f (or any future variant) works without its own entry,
+    and a variant only needs an entry when its numbers genuinely differ.
+    """
+    if not target_model or not info_data:
+        return None
+    for key in info_data:
+        if key.lower() == str(target_model).lower():
+            return key
+    family = camera_model_family(target_model)
+    if family:
+        for key in info_data:
+            if key.lower() == family.lower():
+                return key
+    return None
+
+
+MARKER_SIDES = ("left", "right")
+# How much closer another version's nominal has to be before the live bracket is declared to
+# belong to it. A Step 1 fit moves a bracket by well under a millimetre and a fraction of a
+# degree, while the v1.2 and v1.3 brackets sit ~67 mm and 90 deg apart, so this sits in the
+# empty space between the two and never mistakes a calibration for a version change.
+BRACKET_VERSION_MARGIN_M = 0.005
+BRACKET_VERSION_MARGIN_DEG = 2.0
+
+
+def normalize_robot_version(version):
+    """'v1.3' / '1.3' / 1.3 -> '1.3'."""
+    return str(version).replace("v", "").strip()
+
+
+def marker_bracket_nominal_key(side, version):
+    """setting.yaml key holding the CAD nominal marker bracket for one robot version."""
+    return f"Tf_to_marker_{side}_v{normalize_robot_version(version).replace('.', '')}"
+
+
+def _is_pose(value):
+    return isinstance(value, (list, tuple)) and len(value) >= 6
+
+
+def _pose_rotation(pose):
+    from scipy.spatial.transform import Rotation
+    # Matches make_transform: R = Rz(yaw) @ Ry(pitch) @ Rx(roll), i.e. extrinsic xyz.
+    return Rotation.from_euler("xyz", [pose[3], pose[4], pose[5]], degrees=True)
+
+
+def bracket_pose_delta(pose_a, pose_b):
+    """How far apart two [x, y, z, roll, pitch, yaw] brackets are, as (metres, degrees)."""
+    distance = float(np.linalg.norm(np.asarray(pose_a[:3], dtype=float)
+                                    - np.asarray(pose_b[:3], dtype=float)))
+    relative = _pose_rotation(pose_a).inv() * _pose_rotation(pose_b)
+    return distance, float(np.degrees(np.linalg.norm(relative.as_rotvec())))
+
+
+def marker_bracket_nominals(markers_config, side):
+    """{robot version: nominal bracket} for every `Tf_to_marker_<side>_v<tag>` in the config."""
+    nominals = {}
+    for key, value in (markers_config or {}).items():
+        match = re.fullmatch(rf"Tf_to_marker_{side}_v(\d)(\d+)", str(key))
+        if match and _is_pose(value):
+            nominals[f"{match.group(1)}.{match.group(2)}"] = list(value)
+    return nominals
+
+
+def bracket_version_of(pose, nominals):
+    """Which robot version's bracket `pose` was derived from, or None when it is ambiguous.
+
+    The v1.2 and v1.3 brackets are mounted at a different place and a different angle, so a live
+    Tf_to_marker value sits right next to the nominal it came from and nowhere near the other. The
+    nearest nominal therefore names the version, as long as it wins by more than a calibration's
+    worth of movement -- otherwise this says nothing rather than guessing.
+    """
+    if not _is_pose(pose) or not nominals:
+        return None
+    ranked = sorted(((bracket_pose_delta(pose, nominal), version)
+                     for version, nominal in nominals.items()),
+                    key=lambda item: (item[0][0], item[0][1]))
+    (best_pos, best_rot), best_version = ranked[0]
+    if len(ranked) == 1:
+        return best_version
+    (next_pos, next_rot), _ = ranked[1]
+    if (next_pos - best_pos) < BRACKET_VERSION_MARGIN_M and (next_rot - best_rot) < BRACKET_VERSION_MARGIN_DEG:
+        return None
+    return best_version
+
+
+def resolve_marker_brackets(markers_config, version, log=print):
+    """Which live marker brackets belong to another robot version, and what to replace them with.
+
+    `Tf_to_marker_<side>_v12` / `_v13` are the CAD nominals; `Tf_to_marker_<side>` is the live
+    value the detector and the calibrators actually use, carrying whatever Step 1 fitted on top of
+    one of them. Nothing tied the live value to a robot version, so moving a setting.yaml between
+    a v1.2 and a v1.3 robot silently kept a bracket ~67 mm and 90 deg wrong.
+
+    Returns {side: nominal} for the sides that have to be reset; an empty dict means every live
+    bracket already belongs to `version`.
+    """
+    version = normalize_robot_version(version)
+    changes = {}
+    for side in MARKER_SIDES:
+        nominals = marker_bracket_nominals(markers_config, side)
+        target = nominals.get(version)
+        if target is None:
+            continue
+        live = (markers_config or {}).get(f"Tf_to_marker_{side}")
+        if not _is_pose(live):
+            changes[side] = list(target)
+            continue
+        belongs_to = bracket_version_of(live, nominals)
+        if belongs_to == version:
+            continue
+        if belongs_to is None:
+            distance, angle = bracket_pose_delta(live, target)
+            log(f"[WARNING] Tf_to_marker_{side} matches no robot version's bracket closely enough "
+                f"to tell them apart ({distance * 1000:.1f} mm / {angle:.2f} deg from the v{version} "
+                f"nominal); leaving it as it is.")
+            continue
+        distance, angle = bracket_pose_delta(live, target)
+        log(f"[INFO] Tf_to_marker_{side} is the v{belongs_to} bracket but this robot is v{version} "
+            f"({distance * 1000:.1f} mm / {angle:.2f} deg apart). Loading the v{version} nominal...")
+        changes[side] = list(target)
+    return changes

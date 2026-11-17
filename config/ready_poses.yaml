@@ -6,29 +6,84 @@ v1.2:
     elbow:
       right_arm: [-117.0, -20.0, 0.0, 0.0, -100.0, 85.0, -115.0]
       left_arm: [-117.0, 20.0, 0.0, 0.0, 100.0, 85.0, 115.0]
+    # Same posture as `marker` below, on purpose (v1.3 already pairs them this way).
+    # J6 is solved from where the centre of the J5 circle sits relative to the J6 axis, so the
+    # J5 arc (sweep_joint_B, +-15 deg) has to be swept in full. From the old wrist_pitch posture
+    # the marker ran off the bottom of the frame part way through: 2026-09-21 captured only
+    # 22.18 of 30 deg on the right arm and 26.29 on the left, both ending ~50 px from the image
+    # edge, which biased the circle centre -- and the two arms unequally, since they lost
+    # different amounts. The marker posture keeps the whole sweep in view (its own 40/40/45 deg
+    # sweeps all complete with >100 px of margin).
     wrist_yaw2:
-      right_arm: [-55.0, -45.0, 25.0, -127.0, 90.0, 0.0, 0.0]
-      left_arm: [-55.0, 45.0, -25.0, -127.0, -90.0, 0.0, 0.0]
+      right_arm: [-90.0, -40.0, 73.0, -97.0, 90.0, 90.0, -10.0]
+      left_arm: [-90.0, 40.0, -73.0, -97.0, -80.0, 90.0, 10.0]
   marker:
     right_arm: [-90.0, -40.0, 73.0, -97.0, 90.0, 90.0, -10.0]
     left_arm: [-90.0, 40.0, -73.0, -97.0, -80.0, 90.0, 10.0]
+  # Wizard gripper-change pose (2026-11-12, user): tool flange facing up so the gripper comes off easily. J3+J5 = -180
+  # turns the flange up (FK on the model M v1.2 URDF, arm chains as on model A); J5 -70 stays clear of its -90 limit,
+  # J1 10 deg out keeps the hands off the body (flange 10 deg from vertical).
+  gripper_change:
+    right_arm: [0.0, -10.0, 0.0, -110.0, 0.0, -70.0, 0.0]
+    left_arm: [0.0, 10.0, 0.0, -110.0, 0.0, -70.0, 0.0]
   check_calib:
-    right_arm: [-24.670293247716117, -39.97309779281507, 11.245521098854034, -107.94826174466372, -123.90104309118438, 62.20615349398536, 58.400917359415544]
+    right_arm: [-24.670293247716117,-39.97309779281507, 11.245521098854034, -107.94826174466372, -123.90104309118438, 62.20615349398536, 58.400917359415544]
     left_arm: [-24.673371649425416, 39.977181699521026, -11.2449384541747, -107.94870000866068, 123.90090751555407, 62.20615370729742, -58.400917505707554]
+  # Step 2 wrist-diversity poses (head robots, setting.yaml step2.wrist_diversity_poses): deltas in deg from the
+  # Step 2 baseline -- right/left [J4, J5, J6], head [pan, tilt]; J0-J3 stay at the baseline. Chosen offline on
+  # 2026-09-30 from the 09-29 15:13 D405 run within J4 +-25 / J5 +-20 / J6 +-30 deg (both markers in view with
+  # 60 px margin, marker tilt to the camera <= 30 deg, range <= 330 mm, markers >= 11 cm apart; in the URDF
+  # capsule collision model no pose comes closer to the torso/head or between the hands than the 64 base poses
+  # did on the robot; re-checked on the 12:23 and 14:32 baselines). Offline estimate: weakest Step 2 direction
+  # 2.4 -> 4.8, a 1 deg Step 1 J6 error reaches the check pose about 30 % less. The base plan is unchanged.
+  # 2026-10-27: scaled to 60 % for one real run (16:01) and put back. At full range (14:42) the wrist poses moved
+  # head pan -0.44 -> -0.62 deg and the check pose looked right; at 60 % they left it at -0.39 -> -0.41 and the
+  # right hand sat about 3 mm behind again. Full-range wrist residuals were about 3x the base poses'.
+  step2_wrist_diversity:
+    - {right: [7.0, 3.3, 27.7], left: [-12.8, -13.8, 23.9], head: [-7.5, 12.5]}
+    - {right: [24.5, -17.2, -8.0], left: [14.8, 6.4, -26.0], head: [5.0, 2.5]}
+    - {right: [16.6, -16.9, -4.2], left: [-7.3, 15.7, -20.8], head: [-7.5, 0.0]}
+    - {right: [21.6, -19.5, -18.4], left: [-6.9, 12.7, 3.0], head: [0.0, 2.5]}
+    - {right: [-3.6, 9.8, 0.2], left: [-6.5, -10.3, 17.9], head: [-7.5, -7.5]}
+    - {right: [5.7, -9.8, -7.4], left: [17.2, 17.8, -19.1], head: [0.0, -10.0]}
+    - {right: [-0.9, 15.8, 15.9], left: [-24.7, -17.7, 29.6], head: [0.0, 0.0]}
+    - {right: [22.5, -18.2, -15.9], left: [-3.1, 12.2, 3.9], head: [0.0, 2.5]}
+    - {right: [23.4, -1.8, -11.2], left: [-17.0, -6.6, -3.4], head: [0.0, 10.0]}
+    - {right: [24.6, -10.6, -10.1], left: [-21.2, 16.5, 19.7], head: [0.0, 0.0]}
+    - {right: [6.0, -9.5, -0.3], left: [-2.7, 3.3, 4.2], head: [-10.0, 0.0]}
+    - {right: [14.1, -14.5, -27.2], left: [19.0, 4.3, -24.3], head: [0.0, 0.0]}
+    - {right: [13.6, -9.0, -19.0], left: [-15.1, 2.9, -13.2], head: [0.0, 10.0]}
+    - {right: [19.2, 19.4, 19.0], left: [-12.3, -12.4, 1.5], head: [2.5, 0.0]}
+    - {right: [9.8, 13.3, 27.8], left: [-17.4, -15.5, 8.2], head: [0.0, 2.5]}
+    - {right: [-4.4, 0.3, 26.2], left: [-14.0, 18.7, -6.2], head: [-10.0, 0.0]}
+    - {right: [16.9, -13.4, -0.6], left: [-3.1, 16.1, 3.5], head: [-2.5, 0.0]}
+    - {right: [10.6, -1.0, -22.1], left: [23.6, 7.8, -22.3], head: [-2.5, -7.5]}
+    - {right: [23.4, -15.3, -20.6], left: [-20.8, -7.2, 24.4], head: [0.0, 0.0]}
+    - {right: [17.3, 9.4, -25.2], left: [-17.0, 14.6, -18.3], head: [-10.0, 2.5]}
+    - {right: [11.3, -5.8, -25.2], left: [-17.9, 7.1, -11.3], head: [-2.5, -10.0]}
+    - {right: [2.7, 16.5, -5.8], left: [22.0, 7.2, -25.2], head: [0.0, -2.5]}
+    - {right: [23.8, -18.5, -13.6], left: [-8.1, 5.7, 5.4], head: [0.0, 2.5]}
+    - {right: [2.6, 2.7, 1.7], left: [22.3, 14.0, -14.2], head: [0.0, -10.0]}
 v1.3:
   joint:
+    # J6 -15 / +15 (2026-10-15, was 0 as in `marker`): from J6 = 0 the J6 sweeps ran to the bottom
+    # edge of the D405 image (11-45 px left in the simulator); turned, they keep 55-128 px.
     wrist_pitch:
-      right_arm: [-55.0, -45.0, 25.0, -117.0, 0.0, 0.0, 0.0]
-      left_arm: [-55.0, 45.0, -25.0, -117.0, 0.0, 0.0, 0.0]
+      right_arm: [-55.0, -45.0, 25.0, -117.0, 0.0, 0.0, -15.0]
+      left_arm: [-55.0, 45.0, -25.0, -117.0, 0.0, 0.0, 15.0]
     elbow:
       right_arm: [-107.0, -12.0, 0.0, 0.0, 73.0, -45.0, 0.0]
       left_arm: [-107.0, 12.0, 0.0, 0.0, -73.0, -45.0, 0.0]
-    wrist_roll_v13:
-      right_arm: [-55.0, -45.0, 25.0, -117.0, 0.0, 0.0, 0.0]
-      left_arm: [-55.0, 45.0, -25.0, -117.0, 0.0, 0.0, 0.0]
+    wrist_roll:
+      right_arm: [-55.0, -45.0, 25.0, -117.0, 0.0, 0.0, -15.0]
+      left_arm: [-55.0, 45.0, -25.0, -117.0, 0.0, 0.0, 15.0]
   marker:
     right_arm: [-55.0, -45.0, 25.0, -117.0, 0.0, 0.0, 0.0]
     left_arm: [-55.0, 45.0, -25.0, -117.0, 0.0, 0.0, 0.0]
+  # Wizard gripper-change pose (2026-11-12, user): the marker bracket goes on the gripper, so the elbow at 90 deg is enough.
+  gripper_change:
+    right_arm: [0.0, 0.0, 0.0, -90.0, 0.0, 0.0, 0.0]
+    left_arm: [0.0, 0.0, 0.0, -90.0, 0.0, 0.0, 0.0]
   check_calib:
     right_arm: [-17.82228884572811, -27.04549236723799, 12.864900847863778, -117.00109658957737, -36.77069303997991, 33.009714276936286, 56.151562426380856]
     left_arm: [-17.82482498256172, 27.048507754986268, -12.86455848252023, -117.00150295840393, 36.770642199399795, 33.00941636873258, -56.151542365905975]
