@@ -26,7 +26,8 @@ setup(
         "rby1_sdk>=0.10.0",
         "scipy>=1.14.0",
         "matplotlib>=3.9.1",
-        "pyrealsense2",
+        # aarch64: PyPI's cp312 wheel is a JetPack 7 build; scripts/linux/build_pyrealsense_aarch64.sh builds it instead.
+        'pyrealsense2; platform_machine != "aarch64"',
         "PySide6>=6.7.2",
         "qpsolvers[osqp]==4.11.0",
         "osqp==1.1.1",

@@ -122,6 +122,14 @@ Run the commands in a terminal. Python 3.12 is installed next to the system Pyth
    python -m pip install -r requirements.txt
    python -m pip install -e .
    ```
+
+> [!CAUTION]
+> **Robot UPC / Jetson Orin (aarch64) only: run one more script after step 5.** Without it the camera does not work on the UPC. Skip it on a normal PC (x86_64); the script stops there anyway.
+> ```bash
+> bash scripts/linux/build_pyrealsense_aarch64.sh
+> ```
+> PyPI's aarch64 `pyrealsense2` for Python 3.12 is built for JetPack 7, so `requirements.txt` leaves it out on aarch64 and this script builds it from the librealsense source (v2.59.1) into `.venv`. It asks for the sudo password (build packages, `librealsense2` in `/usr/local`, the udev rule of step 3), builds in `~/librealsense-2.59.1`, and ends by printing the connected cameras. The build takes a while; if it stops with an out-of-memory error, run it again with `JOBS=2 bash scripts/linux/build_pyrealsense_aarch64.sh`.
+
 6. **Camera** (also for the executable): connect the RealSense to a **USB 3.0** port with a USB 3.0 cable.
 7. **Robot network** (also for the executable): give the Ethernet port a fixed IP in the robot's subnet (e.g. `192.168.1.xxx`) and check `ping 192.168.1.40`.
 8. **Launch** from the desktop session of the PC (the app is a GUI; also for the executable):
@@ -172,7 +180,7 @@ On Linux (after steps 1 and 4 of the Linux setup above):
 ```bash
 ./scripts/linux/build_linux.sh
 ```
-The script will automatically set up the virtual environment and output `dist/camera_calibrator_x86_64` (or `camera_calibrator_aarch64` on Jetson). **Build on Ubuntu 22.04** (see the glibc note below).
+The script will automatically set up the virtual environment and output `dist/camera_calibrator_x86_64` (or `camera_calibrator_aarch64` on Jetson). **Build on Ubuntu 22.04** (see the glibc note below). On the UPC / Jetson, run `build_pyrealsense_aarch64.sh` first (the caution after Linux setup step 5); the build stops if `pyrealsense2` is missing.
 
 ### 2. Manual Compilation Command
 If building manually using PyInstaller (not in `requirements.txt`; the build scripts install it):

@@ -38,6 +38,11 @@ python3 -m pip install --upgrade pip
 pip install -r requirements.txt
 pip install pyinstaller
 pip install --no-deps -e .
+# aarch64 skips pyrealsense2 in requirements.txt; without it the binary would start without a camera module.
+if [ "$(uname -m)" = "aarch64" ] && ! python3 -c 'import pyrealsense2' 2>/dev/null; then
+    echo "[ERROR] pyrealsense2 is missing in .venv. Run first: bash scripts/linux/build_pyrealsense_aarch64.sh"
+    exit 1
+fi
 
 # 3. Build with PyInstaller
 echo "[4/4] Building with PyInstaller..."
